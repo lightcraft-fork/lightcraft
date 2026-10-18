@@ -101,11 +101,14 @@ with that preview: a few megabytes of its tens. NEF, ORF, PEF and ARW6 files (th
 files under 4 MiB are read whole, as a normal import reads them. On a 38,500-photo catalog with
 1.1 TB of originals on a USB SSD (mostly EOS R5 Mark II CR3s, plus DNG, ORF and JPEG files) the
 import took about 2 minutes instead of about half an hour. A raw described from its headers gets no content
-hash. A later import of a copy of it from elsewhere still finds it by hashing it then (when at most 16
-photos without a hash share the copy's size), and that hash is kept. Until a photo has a hash, Find
+hash. A later import of a copy of it from elsewhere still finds it: files of the same size and dimensions
+are compared by a hash of their first 512 KiB, and only when those match are both read whole and their full
+hashes compared (and the hash taken is kept). A copy is never called a duplicate without the full hash.
+Files that share size and dimensions with more than 256 photos are not compared. Until a photo has a hash, Find
 Missing Photos matches its file by name and size only, and Reload from Disk takes the same file as
 unchanged (its size, dimensions and preview state decide: no undo step, previews kept). A
-background pass filling in the missing hashes would lift both limits. Sidecars are looked for in a listing of each folder,
+later validated whole read fills a missing hash through the session reader without an extra
+original read or undo entry. This is opportunistic learning, not a background hashing pass. Sidecars are looked for in a listing of each folder,
 read once, rather than by asking the drive for each possible name (slow for files that aren't there
 on exFAT and network drives).
 
@@ -119,3 +122,12 @@ the path relative to the catalog that Lightroom records for root folders on the 
 (`relativePathFromCatalog`), when that is a folder, and reports the remapping as a warning. Copying
 a project folder with its catalog inside it therefore keeps its originals linked. Other moved
 originals stay missing; use LightCraft's missing-photo relinking tools to update their paths.
+
+Original and root folder paths are resolved with the catalog as the document and are looked at
+only when they are on this computer or on the network share the catalog itself is on
+(`crates/engine/src/doc_path.rs`). An original on another computer (`\\server\share\…`,
+`//server/…`, `file://server/…`), a device path, or one whose folder or file name in the catalog is
+an absolute path is not looked at: the import lists it as missing with a warning and leaves the
+photo and its virtual copies out of the library. To import originals on a share, open the catalog
+from that share. A path that is not a path on this computer (a Windows drive path read on macOS or
+Linux) is not looked at either and stays catalogued as missing.

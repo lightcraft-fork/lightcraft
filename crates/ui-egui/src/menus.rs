@@ -1602,6 +1602,7 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
             if app.tasks.is_running(LABEL) {
                 return Some(Err("Find Missing Photos is already searching".into()));
             }
+            let originals = app.session.original_reader();
             let mut candidates = lightcraft_engine::cmd::missing::find_candidates(&app.session.catalog);
             if let Some(within) = within {
                 candidates.retain(|candidate| lightcraft_catalog::query::folder_within(&candidate.path, &within));
@@ -1613,7 +1614,7 @@ pub fn run_ui_command(app: &mut LightcraftApp, id: &str, p: &Value) -> Option<Re
                 if let Some(d) = test_delay {
                     std::thread::sleep(d);
                 }
-                lightcraft_engine::cmd::missing::plan_find_missing(&candidates, &folder)
+                originals.in_scope(|| lightcraft_engine::cmd::missing::plan_find_missing(&candidates, &folder))
             };
             let done = |app: &mut LightcraftApp, ctx: &egui::Context, plan: Result<lightcraft_engine::cmd::missing::FindPlan, String>| {
                 // relinked under the session as it is now: photos relinked meanwhile and files
@@ -2144,12 +2145,13 @@ pub fn ui_enabled(app: &LightcraftApp, id: &str) -> bool {
         "app.exportPrevious" => app.session.active().is_some() && app.session.last_export.is_some(),
         "dialog.pasteSettings" => app.session.active().is_some() && app.session.clipboard.is_some(),
         "photo.openOriginalInExternal" => {
+            // only a file type LightCraft reads can be handed over (#2135); the extension alone
+            // decides, so no disk or share is touched while a menu is drawn
             app.services.open_with.is_some()
-                && app
-                    .session
-                    .active()
-                    .and_then(|id| app.session.catalog.photo(id))
-                    .is_some_and(|p| matches!(p.source, lightcraft_engine::catalog::Source::File { .. }))
+                && app.session.active().and_then(|id| app.session.catalog.photo(id)).is_some_and(|p| match &p.source {
+                    lightcraft_engine::catalog::Source::File { path } => lightcraft_engine::open_path::is_media(std::path::Path::new(path)),
+                    _ => false,
+                })
         }
         "app.showInFinder" => {
             app.services.reveal.is_some()
@@ -2324,8 +2326,15 @@ fn edit_in(app: &mut LightcraftApp, ctx: &egui::Context, p: &Value, photocraft: 
         if let Some(id) = id {
             app.ui.external_edits.push(*id);
         }
-        if let Some(Err(e)) = app.services.open_with.as_mut().map(|f| f(path, &editor)) {
-            failed = Some(e);
+        // the copy is LightCraft's own render, but it goes through the same gate as any other
+        // path handed to the system opener (#2135)
+        match lightcraft_engine::open_path::openable(path, "") {
+            Err(e) => failed = Some(e),
+            Ok(absolute) => {
+                if let Some(Err(e)) = app.services.open_with.as_mut().map(|f| f(&absolute, &editor)) {
+                    failed = Some(e);
+                }
+            }
         }
     }
     match (failed, copies.as_slice()) {
@@ -2377,11 +2386,13 @@ fn open_originals(app: &mut LightcraftApp, p: &Value) -> Result<Value, String> {
     let mut files = Vec::new();
     let mut skipped = Vec::new();
     for id in ids {
-        match app.session.catalog.photo(id).map(|ph| &ph.source) {
-            Some(lightcraft_engine::catalog::Source::File { path }) if std::path::Path::new(path).is_file() => files.push((id, path.clone())),
-            Some(lightcraft_engine::catalog::Source::File { path }) => {
-                skipped.push(json!({"id": id.0, "reason": format!("the original is missing: {path}")}))
-            }
+        // the path may come from an imported catalog: only a photo file LightCraft reads is
+        // handed to the opener, never a program (#2135)
+        match app.session.catalog.photo(id).map(|ph| (ph.file_name.clone(), ph.source.clone())) {
+            Some((name, lightcraft_engine::catalog::Source::File { path })) => match lightcraft_engine::open_path::openable(&path, &name) {
+                Ok(absolute) => files.push((id, absolute)),
+                Err(reason) => skipped.push(json!({"id": id.0, "reason": reason})),
+            },
             Some(_) => skipped.push(json!({"id": id.0, "reason": "a demo photo has no original file"})),
             None => skipped.push(json!({"id": id.0, "reason": "no such photo"})),
         }

@@ -98,7 +98,7 @@ pub fn import_params(s: &Session, p: &Value) -> Result<ImportRequest> {
         metadata_preset,
         convert_dng: bool_or(p, "dng", false),
         local: bool_or(p, "local", false),
-        headers_only: false,
+        headers_only: !bool_or(p, "local", false),
     };
     let album_name = str_param(p, "albumName").map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
     Ok(ImportRequest { paths, opts, album, album_name })
@@ -1489,7 +1489,7 @@ pub fn specs() -> Vec<CommandSpec> {
         always, |_, p| {
             let path = str_param(p,"path").ok_or_else(|| bad("library.inspectLightroom","missing path"))?;
             let data = crate::lightroom_catalog::read(std::path::Path::new(path)).map_err(|e| bad("library.inspectLightroom",e))?;
-            Ok(json!({"photos":data.photos.len(),"collections":data.collections.iter().filter(|r|r.get("systemOnly").and_then(Value::as_f64).unwrap_or(0.0)==0.0).count(),"missing":data.photos.iter().filter(|p| !std::path::Path::new(&p.path).is_file()).map(|p|&p.path).collect::<Vec<_>>(),"warnings":data.warnings}))
+            Ok(json!({"photos":data.photos.len(),"collections":data.collections.iter().filter(|r|r.get("systemOnly").and_then(Value::as_f64).unwrap_or(0.0)==0.0).count(),"missing":data.photos.iter().filter(|p| !p.original_is_file()).map(|p|&p.path).collect::<Vec<_>>(),"warnings":data.warnings}))
         }),
         cmd!(
             "library.importLightroom",

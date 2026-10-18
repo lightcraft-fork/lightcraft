@@ -991,15 +991,18 @@ fn same_folder_as_original_exports_next_to_each_photo() {
     let exists = |p: &str| std::path::Path::new(p).exists();
     let files = crate::export::export_batch(&mut s, &ids, &o, &to, &mut crate::export::write_file, &exists).unwrap();
     let written: Vec<&str> = files.iter().map(|f| f["path"].as_str().unwrap()).collect();
-    let mut want = vec![a.join("Exports/IMG_1.jpg").to_string_lossy().to_string(), b.join("Exports/IMG_1.jpg").to_string_lossy().to_string()];
-    let mut got: Vec<String> = written.iter().map(|p| p.to_string()).collect();
+    let mut want = vec![a.join("Exports").join("IMG_1.jpg"), b.join("Exports").join("IMG_1.jpg")];
+    let mut got: Vec<std::path::PathBuf> = written.iter().map(std::path::PathBuf::from).collect();
     want.sort();
     got.sort();
     assert_eq!(got, want);
     assert!(!dir.join("unused").exists(), "nothing written to the specific folder");
     // again: each folder's own collision gets the next free name
     let files = crate::export::export_batch(&mut s, &ids, &o, &to, &mut crate::export::write_file, &exists).unwrap();
-    assert!(files.iter().all(|f| f["path"].as_str().unwrap().ends_with("Exports/IMG_1-2.jpg")), "{files:?}");
+    assert!(
+        files.iter().all(|f| std::path::Path::new(f["path"].as_str().unwrap()).ends_with(std::path::Path::new("Exports").join("IMG_1-2.jpg"))),
+        "{files:?}"
+    );
     // no subfolder: next to the original, which is never written over
     let beside = ExportOptions { subfolder: String::new(), conflict: Conflict::Overwrite, ..o.clone() };
     let err = crate::export::export_batch(&mut s, &ids, &beside, &to, &mut crate::export::write_file, &exists).unwrap_err();
@@ -1024,21 +1027,24 @@ fn same_folder_as_original_refuses_photos_without_a_folder() {
     let mut s = Session::with_demo();
     let ids: Vec<_> = s.catalog.photos().take(2).map(|p| p.id).collect();
     let mut written = Vec::new();
-    let mut write = |p: &str, _: &[u8]| -> Result<(), String> {
-        written.push(p.to_string());
-        Ok(())
+    // the writer lives in a block of its own, so its borrow of `written` has ended by the time
+    // the assertion below reads it
+    let files = {
+        let mut write = |p: &str, _: &[u8]| -> Result<(), String> {
+            written.push(p.to_string());
+            Ok(())
+        };
+        let err = crate::export::export_batch(&mut s, &ids, &o, &to, &mut write, &|_| false).unwrap_err();
+        assert!(err.contains("no folder on disk"), "{err}");
+        // without stopping: one error per photo, nothing written
+        let items = crate::export::prepare_batch(&mut s, &ids, &o).unwrap();
+        crate::export::run_batch(items, &o, &to, &mut write, &|_| false, false, &mut |_, _| true).unwrap()
     };
-    let err = crate::export::export_batch(&mut s, &ids, &o, &to, &mut write, &|_| false).unwrap_err();
-    assert!(err.contains("no folder on disk"), "{err}");
-    // without stopping: one error per photo, nothing written
-    let items = crate::export::prepare_batch(&mut s, &ids, &o).unwrap();
-    let files = crate::export::run_batch(items, &o, &to, &mut write, &|_| false, false, &mut |_, _| true).unwrap();
     assert_eq!(files.len(), 2);
     for (f, id) in files.iter().zip(&ids) {
         assert_eq!(f["photo"], id.0, "{f}");
         assert!(f["error"].as_str().unwrap().contains("no folder on disk"), "{f}");
     }
-    drop(write);
     assert!(written.is_empty(), "{written:?}");
 
     // a photo on disk whose folder is gone (moved, an unplugged drive)
