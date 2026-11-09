@@ -29,12 +29,26 @@ use crate::RawFormat;
 const HEAD: u64 = 64 * 1024;
 /// An image whose chunks hold fewer bytes than this is read (thumbnails, small previews).
 const BULK: u64 = 256 * 1024;
+/// At most this many bytes between two of an image's chunks are alignment padding.
+const PAD: u64 = 16;
+/// [`reads`]' defaults for a drive where each read costs a round trip: on the raw.pixls.us corpus
+/// they take a RAF from 7 reads in 5 rounds to 4 in 2, and a CR3 from 4.1 to 3.5 reads, for
+/// 0.2–0.3 % more of the file.
+pub const READ_MIN: u64 = 64 * 1024;
+pub const READ_GAP: u64 = 16 * 1024;
 /// The same bounds as `lightcraft_tiff`'s reader.
 const MAX_IFDS: usize = 1024;
 const MAX_ENTRIES: u64 = 8192;
 const MAX_BOXES: usize = 4096;
 /// Child IFDs listed by one `SubIFDs` entry.
 const MAX_CHILDREN: u64 = 4096;
+const MAX_SKIPPED_CHUNKS: usize = 1 << 20;
+/// Pending child-IFD offsets the walker may queue at once: no more than it can ever visit
+/// (the same [`MAX_IFDS`] the seen set is held to, deduplicated as they are popped), so an alley
+/// of hostile `SubIFDs` entries can't grow the queue into the tens of millions of pointers.
+/// The plan never guesses: the walk refuses and the plan reports the whole file when it would go
+/// past the cap.
+const MAX_PENDING: usize = MAX_IFDS;
 /// The RAF raw container's pointer to its raw IFD.
 const RAF_RAW_IFD: u16 = 0xf000;
 
@@ -52,37 +66,42 @@ impl Ranges {
         if start >= end {
             return;
         }
-        let (mut start, mut end) = (start, end);
-        let mut out = Vec::with_capacity(self.0.len() + 1);
-        let mut placed = false;
-        for &(a, b) in &self.0 {
-            if b < start {
-                out.push((a, b));
-            } else if a > end {
-                if !placed {
-                    out.push((start, end));
-                    placed = true;
-                }
-                out.push((a, b));
-            } else {
-                start = start.min(a);
-                end = end.max(b);
+        let first = self.0.partition_point(|&(_, b)| b < start);
+        let last = self.0.partition_point(|&(a, _)| a <= end).max(first);
+        let merged = self.0.get(first..last).unwrap_or_default();
+        let start = merged.first().map_or(start, |&(a, _)| a.min(start));
+        let end = merged.last().map_or(end, |&(_, b)| b.max(end));
+        self.0.splice(first..last, [(start, end)]);
+    }
+
+    pub fn from_spans(mut spans: Vec<(u64, u64)>) -> Self {
+        spans.retain(|&(a, b)| a < b);
+        spans.sort_unstable();
+        let mut out: Vec<(u64, u64)> = Vec::with_capacity(spans.len());
+        for (a, b) in spans {
+            match out.last_mut() {
+                Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                _ => out.push((a, b)),
             }
         }
-        if !placed {
-            out.push((start, end));
-        }
-        self.0 = out;
+        Self(out)
+    }
+
+    /// Add every `[start, end)` of `spans` in one sort and merge (empty ones add nothing).
+    pub fn extend(&mut self, spans: impl IntoIterator<Item = (u64, u64)>) {
+        let mut all = std::mem::take(&mut self.0);
+        all.extend(spans);
+        *self = Self::from_spans(all);
     }
 
     /// Whether all of `[start, end)` is covered (an empty range always is).
     pub fn contains(&self, start: u64, end: u64) -> bool {
-        start >= end || self.0.iter().any(|&(a, b)| a <= start && end <= b)
+        start >= end || self.0.get(self.0.partition_point(|&(_, b)| b < end)).is_some_and(|&(a, b)| a <= start && end <= b)
     }
 
     /// Whether some of `[start, end)` is covered.
     pub fn overlaps(&self, start: u64, end: u64) -> bool {
-        start < end && self.0.iter().any(|&(a, b)| a < end && start < b)
+        start < end && self.0.get(self.0.partition_point(|&(_, b)| b <= start)).is_some_and(|&(a, _)| a < end)
     }
 
     pub fn spans(&self) -> &[(u64, u64)] {
@@ -100,9 +119,10 @@ impl Ranges {
 
     /// The parts of `[start, end)` not covered.
     pub fn gaps(&self, start: u64, end: u64) -> Ranges {
-        let mut out = Ranges::new();
+        // the gaps come in order, apart from each other: pushed, not merged in one by one
+        let mut out = Vec::new();
         let mut at = start;
-        for &(a, b) in &self.0 {
+        for &(a, b) in self.0.get(self.0.partition_point(|&(_, b)| b <= start)..).unwrap_or_default() {
             if b <= at {
                 continue;
             }
@@ -110,26 +130,47 @@ impl Ranges {
                 break;
             }
             if a > at {
-                out.insert(at, a);
+                out.push((at, a));
             }
             at = at.max(b);
         }
         if at < end {
-            out.insert(at, end);
+            out.push((at, end));
         }
-        out
+        Ranges(out)
     }
 
     /// These ranges without the ones in `other`.
     pub fn minus(&self, other: &Ranges) -> Ranges {
         let mut out = Ranges::new();
-        for &(a, b) in &self.0 {
-            for &(x, y) in other.gaps(a, b).spans() {
-                out.insert(x, y);
-            }
-        }
+        out.extend(self.0.iter().flat_map(|&(a, b)| other.gaps(a, b).0));
         out
     }
+
+    /// These ranges with the gaps of at most `gap` bytes between them filled in.
+    pub fn bridged(&self, gap: u64) -> Ranges {
+        let mut out: Vec<(u64, u64)> = Vec::with_capacity(self.0.len());
+        for &(a, b) in &self.0 {
+            match out.last_mut() {
+                Some(last) if a.saturating_sub(last.1) <= gap => last.1 = b,
+                _ => out.push((a, b)),
+            }
+        }
+        Ranges(out)
+    }
+}
+
+/// The reads that load what a plan says it `need`s on a file of `len` bytes with `loaded` read,
+/// for a drive where every read costs a round trip (a network share, a hard disk): each range is
+/// read at least `min` bytes long, since the plan's next round usually asks for what follows a
+/// header; ranges at most `gap` apart are read as one; and the bytes already loaded are left out
+/// (unless they sit in such a gap). Everything in `need` is covered.
+pub fn reads(need: &Ranges, loaded: &Ranges, len: u64, min: u64, gap: u64) -> Ranges {
+    let mut wide = Ranges::new();
+    for &(a, b) in need.spans() {
+        wide.insert(a, b.max(a.saturating_add(min).min(len)));
+    }
+    wide.minus(loaded).bridged(gap)
 }
 
 /// What [`header_plan`] says about a partly loaded file.
@@ -180,12 +221,17 @@ fn plan(bytes: &[u8], loaded: &Ranges, preview: bool) -> HeaderPlan {
 struct Want<'a> {
     len: u64,
     loaded: &'a Ranges,
-    need: Ranges,
+    /// What is missing, as found; merged once into the plan (merging each find into the ranges so
+    /// far was a copy of them per find: quadratic over a file of many out-of-line values).
+    need: Vec<(u64, u64)>,
+    /// `need` is merged when it reaches this long, so repeated finds of one gap stay bounded by
+    /// the distinct gaps (merging when it doubles keeps the cost linear).
+    compact_at: usize,
 }
 
 impl<'a> Want<'a> {
     fn new(bytes: &[u8], loaded: &'a Ranges) -> Self {
-        Self { len: bytes.len() as u64, loaded, need: Ranges::new() }
+        Self { len: bytes.len() as u64, loaded, need: Vec::new(), compact_at: 64 }
     }
 
     /// Whether `[start, end)` (clipped to the file) is loaded; asks for what isn't.
@@ -194,15 +240,21 @@ impl<'a> Want<'a> {
         if self.loaded.contains(start, end) {
             return true;
         }
-        for &(a, b) in self.loaded.gaps(start, end).spans() {
-            self.need.insert(a, b);
+        self.need.extend(self.loaded.gaps(start, end).0);
+        if self.need.len() >= self.compact_at {
+            let mut merged = Ranges::new();
+            merged.extend(std::mem::take(&mut self.need));
+            self.need = merged.spans().to_vec();
+            self.compact_at = (self.need.len() * 2).max(64);
         }
         false
     }
 
     /// `Need` when something is missing.
     fn into_plan(self) -> Option<HeaderPlan> {
-        (!self.need.is_empty()).then_some(HeaderPlan::Need(self.need))
+        let mut need = Ranges::new();
+        need.extend(self.need);
+        (!need.is_empty()).then_some(HeaderPlan::Need(need))
     }
 }
 
@@ -231,7 +283,7 @@ fn tiff_plan(bytes: &[u8], loaded: &Ranges, preview: bool) -> HeaderPlan {
         return HeaderPlan::Whole("its header probe reads samples");
     }
     let Ok(tiff) = Tiff::parse(bytes) else { return HeaderPlan::Whole("TIFF structure") };
-    let mut holes = Ranges::new();
+    let mut spans = Vec::new();
     for ifd in tiff.all_ifds() {
         let chunks: Vec<(u64, u64)> = match ifd.image() {
             // a preview's strips are read when the preview is wanted: only the raw image is skipped
@@ -249,11 +301,27 @@ fn tiff_plan(bytes: &[u8], loaded: &Ranges, preview: bool) -> HeaderPlan {
         if total < BULK {
             continue;
         }
-        for (i, &(offset, size)) in chunks.iter().enumerate() {
-            let start = if i == 0 { offset.saturating_add(HEAD) } else { offset };
-            holes.insert(start, offset.saturating_add(size).min(len));
+        if spans.len().saturating_add(chunks.len()) > MAX_SKIPPED_CHUNKS {
+            return HeaderPlan::Whole("too many strips or tiles");
+        }
+        // (offset, where the skipped part starts, end) of each chunk
+        let mut skipped: Vec<(u64, u64, u64)> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, &(offset, size))| (offset, if i == 0 { offset.saturating_add(HEAD) } else { offset }, offset.saturating_add(size).min(len)))
+            .collect();
+        spans.extend(skipped.iter().map(|&(_, start, end)| (start, end)));
+        // the padding between two skipped chunks (a writer aligns each chunk to a word) is skipped
+        // too: a tiled DNG would otherwise be hundreds of one-byte reads
+        skipped.sort_unstable();
+        for pair in skipped.windows(2) {
+            let &[(_, start, end), (next, next_start, next_end)] = pair else { continue };
+            if start < end && next_start == next && next < next_end && next > end && next - end <= PAD {
+                spans.push((end, next));
+            }
         }
     }
+    let mut holes = Ranges::from_spans(spans);
     // A Panasonic RW2 keeps its raw data from `RawDataOffset` to the end, outside any TIFF image.
     if holes.is_empty()
         && bytes.starts_with(b"IIU\0")
@@ -291,6 +359,13 @@ fn walk_tiff(w: &mut Want, origin: u64, data: &[u8], extra: &[u16]) -> Result<Ra
     };
     let mut stack = vec![first];
     let mut seen = HashSet::new();
+    // Every offset ever queued: the pending cap counts distinct IFDs, so a thousand references to
+    // one child cost one visit, not a thousand.
+    let mut queued = HashSet::from([first]);
+    // Every IFD table and out-of-line value, collected and merged once at the end: an insert
+    // per entry would scan the ranges of every entry before it — quadratic in the metadata
+    // this walker collects.
+    let mut spans: Vec<(u64, u64)> = Vec::new();
     while let Some(off) = stack.pop() {
         if off == 0 || off >= len || seen.len() >= MAX_IFDS || !seen.insert(off) {
             continue;
@@ -312,7 +387,7 @@ fn walk_tiff(w: &mut Want, origin: u64, data: &[u8], extra: &[u16]) -> Result<Ra
         if !w.want(at(off), at(end)) {
             continue;
         }
-        meta.insert(at(off), at(end));
+        spans.push((at(off), at(end)));
         for i in 0..n_read {
             let p = table + i * entry;
             let Ok(pu) = usize::try_from(p) else { continue };
@@ -331,7 +406,7 @@ fn walk_tiff(w: &mut Want, origin: u64, data: &[u8], extra: &[u16]) -> Result<Ra
             };
             let Some(value_end) = start.checked_add(total).filter(|&e| e <= len) else { continue };
             if total > inline {
-                meta.insert(at(start), at(value_end));
+                spans.push((at(start), at(value_end)));
             }
             let child = matches!(tag, t::SUB_IFDS | t::EXIF_IFD | t::GPS_IFD | t::INTEROP_IFD) || extra.contains(&tag);
             let locates = child || matches!(tag, t::STRIP_OFFSETS | t::STRIP_BYTE_COUNTS | t::TILE_OFFSETS | t::TILE_BYTE_COUNTS);
@@ -342,14 +417,24 @@ fn walk_tiff(w: &mut Want, origin: u64, data: &[u8], extra: &[u16]) -> Result<Ra
             let take = if tag == t::SUB_IFDS { count.min(MAX_CHILDREN) } else { count.min(1) };
             for k in 0..take {
                 if let Some(v) = unsigned(data, order, typ, start + k * typ.size() as u64) {
+                    if v == 0 || v >= len || !queued.insert(v) {
+                        continue;
+                    }
+                    if stack.len() >= MAX_PENDING {
+                        return Err("too many child IFDs queued to visit");
+                    }
                     stack.push(v);
                 }
             }
         }
-        if complete && let Some(next) = offset_at(table_end) {
+        if complete && let Some(next) = offset_at(table_end).filter(|&next| next != 0 && next < len && queued.insert(next)) {
+            if stack.len() >= MAX_PENDING {
+                return Err("too many child IFDs queued to visit");
+            }
             stack.push(next);
         }
     }
+    meta.extend(spans);
     Ok(meta)
 }
 
@@ -519,6 +604,63 @@ mod tests {
         assert_eq!(r.total(), 20);
     }
 
+    /// Reads cover what is needed, at least `min` long (not past the file's end), close ones as one,
+    /// without the loaded bytes unless they sit in a bridged gap.
+    #[test]
+    fn reads_cover_the_need_in_fewer_larger_reads() {
+        let mut need = Ranges::new();
+        need.insert(100, 110);
+        need.insert(150, 160);
+        need.insert(1000, 1010);
+        need.insert(1040, 1045);
+        need.insert(1990, 1995);
+        let mut loaded = Ranges::new();
+        loaded.insert(0, 100);
+        loaded.insert(1020, 1030);
+        // no widening, no bridging: the need itself
+        assert_eq!(reads(&need, &loaded, 2000, 0, 0), need);
+        // close ranges as one (over loaded bytes too); the far one stays apart
+        assert_eq!(reads(&need, &loaded, 2000, 0, 50).spans(), &[(100, 160), (1000, 1045), (1990, 1995)]);
+        // at least 100 bytes, clipped to the file; the loaded 1020..1030 left out
+        assert_eq!(reads(&need, &loaded, 2000, 100, 0).spans(), &[(100, 250), (1000, 1020), (1030, 1140), (1990, 2000)]);
+        // ... unless it sits in a bridged gap
+        assert_eq!(reads(&need, &loaded, 2000, 100, 64).spans(), &[(100, 250), (1000, 1140), (1990, 2000)]);
+        for (min, gap) in [(0, 0), (100, 0), (0, 50), (100, 64), (u64::MAX, u64::MAX)] {
+            let r = reads(&need, &loaded, 2000, min, gap);
+            assert!(need.spans().iter().all(|&(a, b)| r.contains(a, b)), "{min} {gap}");
+            assert!(r.spans().iter().all(|&(_, b)| b <= 2000), "{min} {gap}");
+        }
+    }
+
+    #[test]
+    fn a_plan_of_many_missing_values_is_gathered_in_one_merge() {
+        // 200 000 loaded spans with a byte missing between each: every gap wanted once
+        let mut loaded = Ranges::new();
+        loaded.extend((0..20_000u64).map(|i| (i * 4, i * 4 + 3)));
+        let bytes = vec![0u8; 80_000];
+        let mut w = Want::new(&bytes, &loaded);
+        for i in 0..20_000u64 {
+            assert!(!w.want(i * 4 + 2, i * 4 + 4));
+        }
+        let Some(HeaderPlan::Need(need)) = w.into_plan() else { panic!("a plan") };
+        assert_eq!(need.spans().len(), 20_000);
+        assert_eq!(need.total(), 20_000);
+        assert_eq!(loaded.gaps(0, 12).spans(), &[(3, 4), (7, 8), (11, 12)]);
+    }
+
+    #[test]
+    fn repeated_wants_of_one_gap_keep_the_buffer_bounded() {
+        let loaded = Ranges::new();
+        let bytes = vec![0u8; 1000];
+        let mut w = Want::new(&bytes, &loaded);
+        for _ in 0..100_000 {
+            assert!(!w.want(10, 20));
+            assert!(w.need.len() <= 64);
+        }
+        let Some(HeaderPlan::Need(need)) = w.into_plan() else { panic!("a plan") };
+        assert_eq!(need.spans(), &[(10, 20)]);
+    }
+
     #[test]
     fn hostile_input_never_panics_and_ends() {
         let mut loaded = Ranges::new();
@@ -555,6 +697,87 @@ mod tests {
         assert_eq!(run(&raf, 160, 0).0, HeaderPlan::Whole("RAF raw container"));
     }
 
+    #[test]
+    fn ranges_built_from_a_million_chunks_stay_linear() {
+        use lightcraft_tiff::{ByteOrder, IfdBuilder, TiffWriter, Value};
+        let n = 1_000_000u32;
+        let data = 64u32;
+        let mut ifd = IfdBuilder::new();
+        ifd.set(t::IMAGE_WIDTH, Value::Long(vec![1]));
+        ifd.set(t::IMAGE_LENGTH, Value::Long(vec![n]));
+        ifd.set(t::BITS_PER_SAMPLE, Value::Short(vec![8]));
+        ifd.set(t::PHOTOMETRIC, Value::Short(vec![t::photometric::CFA]));
+        ifd.set(t::ROWS_PER_STRIP, Value::Long(vec![1]));
+        ifd.set(t::STRIP_OFFSETS, Value::Long((0..n).map(|i| data + (n - 1 - i) * 2).collect()));
+        ifd.set(t::STRIP_BYTE_COUNTS, Value::Long(vec![1; n as usize]));
+        let file = TiffWriter::new(ByteOrder::Little, false).write(&[ifd]).unwrap();
+        let mut loaded = Ranges::new();
+        loaded.insert(0, file.len() as u64);
+        let started = std::time::Instant::now();
+        let plan = header_plan(&file, &loaded);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+        assert!(matches!(plan, HeaderPlan::Whole(_)), "{plan:?}");
+
+        let spans: Vec<(u64, u64)> = (0..u64::from(n)).rev().map(|i| (i * 2, i * 2 + 1)).collect();
+        let started = std::time::Instant::now();
+        let r = Ranges::from_spans(spans);
+        let mut one_by_one = Ranges::new();
+        for i in 0..u64::from(n) {
+            one_by_one.insert(i * 2, i * 2 + 1);
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+        assert_eq!(r, one_by_one);
+        assert_eq!(r.spans().len(), n as usize);
+        assert_eq!(r.gaps(0, u64::from(n) * 2).total(), u64::from(n));
+    }
+
+    /// A writer that word-aligns its tiles leaves a pad byte after each odd-length one. The pad is
+    /// skipped with the tiles, not asked for one byte at a time: Adobe-converted DNGs on raw.pixls.us
+    /// made the plan ask for up to 240 one-byte ranges, each a read of its own (issue #832, SMB).
+    #[test]
+    fn padding_between_tiles_is_skipped_with_them() {
+        use crate::dngwrite::{DngCompression, DngWriteOptions, write_dng};
+        use crate::{BlackLevel, Cfa, ColorData, Metadata, OpcodeLists, Orientation, RawData, RawImage, Rect};
+        let (w, h) = (512, 512);
+        let mut seed = 1u32;
+        let data = (0..w * h)
+            .map(|_| {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                528 + (seed >> 20) as u16 % 3500
+            })
+            .collect();
+        let raw = RawImage {
+            format: RawFormat::Dng,
+            width: w,
+            height: h,
+            cpp: 1,
+            data: RawData::U16(data),
+            cfa: Cfa::bayer("RGGB"),
+            bits: 12,
+            black: BlackLevel::uniform(528.0),
+            white: vec![4095.0],
+            active_area: Rect::new(0, 0, w, h),
+            crop: Rect::new(0, 0, w, h),
+            orientation: Orientation::Normal,
+            color: ColorData::default(),
+            wb_multipliers: None,
+            linearized: false,
+            pixel_aspect: 1.0,
+            opcodes: OpcodeLists::default(),
+            metadata: Metadata::default(),
+            lens_metadata: Default::default(),
+        };
+        let file = write_dng(&raw, &DngWriteOptions { compression: DngCompression::Lj92 { tile: 64 }, ..Default::default() }).unwrap();
+        let tiff = Tiff::parse(&file).unwrap();
+        let counts = tiff.all_ifds().into_iter().find_map(|ifd| ifd.u64s(t::TILE_BYTE_COUNTS)).unwrap();
+        assert!(counts.iter().filter(|&&n| n % 2 == 1).count() > 8, "the tiles are padded");
+        let (plan, buf, loaded) = run(&file, 16, 0);
+        assert_eq!(plan, HeaderPlan::Ready);
+        assert!(loaded.spans().len() <= 3, "{} ranges read", loaded.spans().len());
+        assert!(loaded.total() * 4 < file.len() as u64, "{} of {} bytes", loaded.total(), file.len());
+        assert_eq!(format!("{:?}", crate::probe_info(&buf)), format!("{:?}", crate::probe_info(&file)));
+    }
+
     /// An ARW6 header probe reads every tile's headers and the first lines of its data, which lie in the strip a
     /// plan would skip: here the second tile, past a first one of bulk size.
     #[test]
@@ -566,5 +789,107 @@ mod tests {
         let file = arw6_file(&[(0, 0, 64, 48, first), (64, 0, 64, 48, tile)], 128, 48);
         assert!(crate::probe_info(&file).is_ok());
         assert_eq!(run(&file, 16, 0).0, HeaderPlan::Whole("an ARW6 header probe reads its tiles"));
+    }
+
+    /// An IFD whose `SubIFDs` entries would queue 33 million child pointers (8192 entries of
+    /// 4096 values apiece, all pointing at the same array) is refused at the walker's pending
+    /// cap instead of growing the queue — and the plan reports the whole file, never guessing.
+    #[test]
+    fn a_subifds_alley_is_refused_at_the_pending_cap() {
+        // First read everything, so the walk reaches the directory table itself.
+        let n = 8192u32;
+        let len = 8 + 2 + (n * 12 + 4 + 4 * 4096) as usize;
+        let mut tiff = b"II*\0\x08\0\0\0".to_vec();
+        tiff.extend_from_slice(&(n as u16).to_le_bytes());
+        let mut entry = |tag: u16, typ: u16, count: u32, value: u32| {
+            tiff.extend_from_slice(&tag.to_le_bytes());
+            tiff.extend_from_slice(&typ.to_le_bytes());
+            tiff.extend_from_slice(&count.to_le_bytes());
+            tiff.extend_from_slice(&value.to_le_bytes());
+        };
+        // header (8) + count field (2) + the {n} numbers and pointer (4), then the value array
+        let values_at = (8 + 2u64 + u64::from(n) * 12 + 4) as u32;
+        for _ in 0..n {
+            entry(t::SUB_IFDS, 4, MAX_CHILDREN as u32, values_at);
+        }
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff.extend((1..=4096u32).flat_map(u32::to_le_bytes));
+        let mut loaded = Ranges::new();
+        loaded.insert(0, len as u64);
+        let mut w = Want::new(&tiff, &loaded);
+        assert_eq!(walk_tiff(&mut w, 0, &tiff, &[]), Err("too many child IFDs queued to visit"));
+    }
+
+    /// A TIFF with many out-of-line values across 512 directories is planned in one sort and
+    /// merge, not one pass over all accumulated ranges per value (CodeRabbit #52: before, each
+    /// `Ranges::insert` copied every range found before it — the ~million disjoint values of the
+    /// fixture below ask for more copying than the timeout allows).
+    #[test]
+    fn many_out_of_line_values_plan_fast() {
+        let (ifds, values) = (512usize, 2048usize);
+        let ifd_len = 2 + values * 12 + 4;
+        let values_at = 8 + ifds * ifd_len;
+        let len = values_at + values * 8;
+        let mut tiff = vec![0u8; len];
+        tiff[..8].copy_from_slice(b"II*\0\x08\0\0\0");
+        for i in 0..ifds {
+            let at = 8 + i * ifd_len;
+            // {values} out-of-line strings (count 8 > the 4 inline bytes), then the next-IFD
+            // pointer; every value is a disjoint 8-byte range for the merge to handle.
+            tiff[at..at + 2].copy_from_slice(&(values as u16).to_le_bytes());
+            for k in 0..values {
+                let e = at + 2 + k * 12;
+                tiff[e..e + 2].copy_from_slice(&t::MAKE.to_le_bytes());
+                tiff[e + 2..e + 4].copy_from_slice(&2u16.to_le_bytes()); // ASCII: 8 bytes > inline — a span per entry
+                tiff[e + 4..e + 8].copy_from_slice(&8u32.to_le_bytes());
+                tiff[e + 8..e + 12].copy_from_slice(&(values_at as u32 + (k * 8) as u32).to_le_bytes());
+            }
+            let next = if i == ifds - 1 { 0u32 } else { (at + ifd_len) as u32 };
+            tiff[at + ifd_len - 4..at + ifd_len].copy_from_slice(&next.to_le_bytes());
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut loaded = Ranges::new();
+            loaded.insert(0, len as u64);
+            let _ = tx.send(header_plan(&tiff, &loaded));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(20)).expect("header_plan took longer than 20 s");
+    }
+
+    /// A TIFF with a million one-byte strips listed in descending order and all byte counts 0:
+    /// the plan is built in one sort and merge, not one pass over all strips (or all holes) per
+    /// strip.
+    #[test]
+    fn many_strips_without_byte_counts_plan_fast() {
+        let n = 1_000_000u32;
+        let (offsets_at, counts_at) = (8 + 2 + 5 * 12 + 4, 8 + 2 + 5 * 12 + 4 + 4 * n);
+        let data = counts_at + 4 * n;
+        let mut tiff = b"II*\0\x08\0\0\0".to_vec();
+        tiff.extend_from_slice(&5u16.to_le_bytes());
+        let entry = |tiff: &mut Vec<u8>, tag: u16, typ: u16, count: u32, value: u32| {
+            tiff.extend_from_slice(&tag.to_le_bytes());
+            tiff.extend_from_slice(&typ.to_le_bytes());
+            tiff.extend_from_slice(&count.to_le_bytes());
+            tiff.extend_from_slice(&value.to_le_bytes());
+        };
+        entry(&mut tiff, 256, 4, 1, 1);
+        entry(&mut tiff, 257, 4, 1, n);
+        entry(&mut tiff, 273, 4, n, offsets_at);
+        entry(&mut tiff, 278, 4, 1, 1);
+        entry(&mut tiff, 279, 4, n, counts_at);
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        for i in (0..n).rev() {
+            tiff.extend_from_slice(&(data + i).to_le_bytes());
+        }
+        tiff.resize(data as usize + n as usize, 0);
+        let len = tiff.len() as u64;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut loaded = Ranges::new();
+            loaded.insert(0, len);
+            let _ = tx.send(header_plan(&tiff, &loaded));
+        });
+        let plan = rx.recv_timeout(std::time::Duration::from_secs(20)).expect("header_plan took longer than 20 s");
+        assert!(!matches!(plan, HeaderPlan::Need(_)), "{plan:?}");
     }
 }

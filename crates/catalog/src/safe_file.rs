@@ -23,6 +23,7 @@
 //!   replacing anything** (a hard link, which fails on a taken name; where the volume has no hard
 //!   links, an exclusive create that claims the name, then a rename over that placeholder).
 //! - [`same_file`] tells whether two paths name the same file on disk (device + inode on Unix,
+//!   volume serial number + file index on Windows,
 //!   resolved paths elsewhere), for "is this target an original?" checks.
 
 use std::cell::Cell;
@@ -128,6 +129,12 @@ fn create_temp(path: &Path) -> io::Result<(PathBuf, File)> {
 /// Write a temp file next to `path` with what `fill` writes, synced to disk when `sync`. On
 /// failure the temp file is removed. Returns its path and length.
 fn write_temp(path: &Path, sync: bool, fill: &mut dyn FnMut(&mut dyn Write) -> io::Result<()>) -> io::Result<(PathBuf, u64)> {
+    write_temp_owned(path, sync, fill).map(|(path, n, _)| (path, n))
+}
+
+/// [`write_temp`], also returning the written file's handle so the caller can tell its temp file
+/// from one put in its place.
+fn write_temp_owned(path: &Path, sync: bool, fill: &mut dyn FnMut(&mut dyn Write) -> io::Result<()>) -> io::Result<(PathBuf, u64, File)> {
     let (tmp, file) = create_temp(path)?;
     let r = (|| {
         let limit = FAIL_AFTER.with(Cell::get);
@@ -139,10 +146,10 @@ fn write_temp(path: &Path, sync: bool, fill: &mut dyn FnMut(&mut dyn Write) -> i
         if sync {
             sync_file(&f)?;
         }
-        Ok(n)
+        Ok((n, f))
     })();
     match r {
-        Ok(n) => Ok((tmp, n)),
+        Ok((n, file)) => Ok((tmp, n, file)),
         Err(e) => {
             let _ = fs::remove_file(&tmp);
             Err(e)
@@ -221,6 +228,102 @@ pub fn write_new_unique(candidates: &mut dyn Iterator<Item = PathBuf>, data: &[u
     r
 }
 
+/// Write `data` to the first free name among `candidates`, never replacing a file, then run
+/// `verify` on the published file. `same` tells whether two handles are one file: a file that is
+/// not the one written is never removed, and an error names the path left behind. Returns the
+/// name taken and what `verify` returned.
+pub fn write_new_unique_verified<T>(
+    candidates: &mut dyn Iterator<Item = PathBuf>,
+    data: &[u8],
+    verify: &mut dyn FnMut(&Path, &[u8]) -> io::Result<T>,
+    same: &dyn Fn(&File, &File) -> bool,
+) -> io::Result<(PathBuf, T)> {
+    write_new_unique_verified_with(candidates, data, verify, same, &publish_new, &|path| fs::remove_file(path))
+}
+
+/// [`write_new_unique_verified`] with the publishing and alias removal steps passed in (tests
+/// inject failures there).
+fn write_new_unique_verified_with<T>(
+    candidates: &mut dyn Iterator<Item = PathBuf>,
+    data: &[u8],
+    verify: &mut dyn FnMut(&Path, &[u8]) -> io::Result<T>,
+    same: &dyn Fn(&File, &File) -> bool,
+    publish: &dyn Fn(&Path, &Path) -> io::Result<()>,
+    remove_alias: &dyn Fn(&Path) -> io::Result<()>,
+) -> io::Result<(PathBuf, T)> {
+    let owns = |owned: &File, path: &Path| {
+        fs::symlink_metadata(path).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
+            && File::open(path).is_ok_and(|current| same(owned, &current))
+    };
+    let mut candidates = candidates.peekable();
+    let Some(first) = candidates.peek().cloned() else {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "no file name to write"));
+    };
+    let (tmp, _, written) = write_temp_owned(&first, true, &mut |w| w.write_all(data))?;
+    let owned = File::open(&tmp)
+        .and_then(|read| if same(&written, &read) { Ok(read) } else { Err(io::Error::other("temporary file identity could not be verified")) });
+    let owned = match owned {
+        Ok(owned) => owned,
+        Err(error) => {
+            if owns(&written, &tmp) {
+                let _ = fs::remove_file(&tmp);
+            }
+            return Err(io::Error::other(format!("{error}; inspect temporary path {}", tmp.display())));
+        }
+    };
+    drop(written);
+    let mut removed = false;
+    let result = (|| {
+        for path in candidates.by_ref().take(100_000) {
+            if !owns(&owned, &tmp) {
+                return Err(io::Error::other(format!("the temporary alias changed before publication: {}", tmp.display())));
+            }
+            match publish(&tmp, &path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+            let checked = (|| {
+                match fs::symlink_metadata(&tmp) {
+                    Ok(_) => {
+                        if !owns(&owned, &tmp) {
+                            return Err(io::Error::other(format!("the temporary alias changed before verification: {}", tmp.display())));
+                        }
+                        remove_alias(&tmp)?;
+                        removed = true;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => removed = true,
+                    Err(e) => return Err(e),
+                }
+                sync_dir(parent_of(&path));
+                let value = verify(&path, data)?;
+                if !owns(&owned, &path) {
+                    return Err(io::Error::other("the published file identity changed"));
+                }
+                Ok(value)
+            })();
+            return match checked {
+                Ok(value) => Ok((path, value)),
+                Err(error) => {
+                    if owns(&owned, &path) {
+                        match fs::remove_file(&path) {
+                            Ok(()) => Err(error),
+                            Err(cleanup) => Err(io::Error::other(format!("{error}; could not remove {}: {cleanup}", path.display()))),
+                        }
+                    } else {
+                        Err(io::Error::other(format!("{error}; unproven file left at {}", path.display())))
+                    }
+                }
+            };
+        }
+        Err(io::Error::new(io::ErrorKind::AlreadyExists, format!("{}: no free file name", first.display())))
+    })();
+    if !removed && owns(&owned, &tmp) {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
 /// Give the complete temp file `tmp` the name `path`, unless that is taken.
 fn publish_new(tmp: &Path, path: &Path) -> io::Result<()> {
     match fs::hard_link(tmp, path) {
@@ -267,24 +370,73 @@ fn same_content(path: &Path, data: &[u8]) -> io::Result<bool> {
     }
 }
 
-/// Do `a` and `b` name the same existing file (through links, `..`, case-insensitive names)?
+/// Do `a` and `b` name the same existing file (through hard links, symlinks, `..`,
+/// case-insensitive names)?
 pub fn same_file(a: &Path, b: &Path) -> bool {
-    let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b)) else { return false };
+    compare_files(a, b, false).unwrap_or(false)
+}
+
+/// [`same_file`] for a check that must not let an unknown identity pass: `Err` when the metadata
+/// of either path cannot be read for a reason other than the path not existing (for example a
+/// folder it cannot enter), or when both paths exist with the same length but the file identity
+/// of either cannot be read (on Windows, when either file cannot be opened or reports file index 0). A path that does not
+/// exist is still `Ok(false)`.
+pub fn same_file_strict(a: &Path, b: &Path) -> io::Result<bool> {
+    compare_files(a, b, true)
+}
+
+fn compare_files(a: &Path, b: &Path, strict: bool) -> io::Result<bool> {
+    let missing = |e: &io::Error| matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory);
+    let (ma, mb) = match (fs::metadata(a), fs::metadata(b)) {
+        (Ok(ma), Ok(mb)) => (ma, mb),
+        (Err(e), _) | (_, Err(e)) if strict && !missing(&e) => return Err(e),
+        _ => return Ok(false),
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        ma.dev() == mb.dev() && ma.ino() == mb.ino()
+        Ok(ma.dev() == mb.dev() && ma.ino() == mb.ino())
     }
     #[cfg(not(unix))]
     {
         if ma.len() != mb.len() {
-            return false;
+            return Ok(false);
         }
-        match (fs::canonicalize(a), fs::canonicalize(b)) {
+        // A hard link has its own path but shares the volume serial number and file index with
+        // its original. A file index of 0 produces an error in strict mode. Lenient mode compares resolved paths.
+        // On ReFS two files can share the 64-bit file index, so the lengths are compared first.
+        #[cfg(windows)]
+        {
+            match file_ids(a, b).and_then(|(ia, ib)| same_file_id(ia, ib, strict)) {
+                Ok(true) => return Ok(true),
+                Ok(_) => {}
+                Err(e) if strict => return Err(e),
+                Err(_) => {}
+            }
+        }
+        Ok(match (fs::canonicalize(a), fs::canonicalize(b)) {
             (Ok(x), Ok(y)) => x == y || x.to_string_lossy().to_lowercase() == y.to_string_lossy().to_lowercase(),
             _ => false,
-        }
+        })
     }
+}
+
+/// The volume serial number and file index of `a` and `b`, read while both files are open.
+#[cfg(windows)]
+fn file_ids(a: &Path, b: &Path) -> io::Result<((u64, u64), (u64, u64))> {
+    use winapi_util::{Handle, file::information};
+    let (ha, hb) = (Handle::from_path_any(a)?, Handle::from_path_any(b)?);
+    let (ia, ib) = (information(&ha)?, information(&hb)?);
+    Ok(((ia.volume_serial_number(), ia.file_index()), (ib.volume_serial_number(), ib.file_index())))
+}
+
+/// The comparison uses each file's volume serial number and file index. Strict mode returns an error for file index 0.
+#[cfg(any(windows, test))]
+fn same_file_id(a: (u64, u64), b: (u64, u64), strict: bool) -> io::Result<bool> {
+    if strict && (a.1 == 0 || b.1 == 0) {
+        return Err(io::Error::other("file identity is unavailable"));
+    }
+    Ok(a.1 != 0 && b.1 != 0 && a == b)
 }
 
 #[cfg(test)]
@@ -304,6 +456,159 @@ mod tests {
         v
     }
 
+    #[cfg(unix)]
+    mod final_verification {
+        use super::*;
+        use std::os::unix::fs::MetadataExt;
+        fn same(a: &File, b: &File) -> bool {
+            let (a, b) = (a.metadata().unwrap(), b.metadata().unwrap());
+            (a.dev(), a.ino()) == (b.dev(), b.ino())
+        }
+        fn stamp(f: &File) -> (u64, u64, i64, i64) {
+            let m = f.metadata().unwrap();
+            (m.dev(), m.ino(), m.ctime(), m.ctime_nsec())
+        }
+        #[test]
+        fn final_verifier_runs_once_after_all_own_alias_mutations() {
+            for rename in [false, true] {
+                let dir = temp(&format!("final-verify-{rename}"));
+                let path = dir.join("output.dng");
+                let count = Cell::new(0);
+                let ((path, (held, before)), expected) = (
+                    write_new_unique_verified_with(
+                        &mut std::iter::once(path),
+                        b"expected-data",
+                        &mut |path, expected| {
+                            count.set(count.get() + 1);
+                            assert!(!names(&dir).iter().any(|n| n.ends_with(".tmp")), "temporary alias must be gone before the only readback");
+                            let mut held = File::open(path)?;
+                            let mut bytes = Vec::new();
+                            use std::io::Read;
+                            held.read_to_end(&mut bytes)?;
+                            assert_eq!(bytes, expected);
+                            let before = stamp(&held);
+                            Ok((held, before))
+                        },
+                        &same,
+                        &|tmp, path| if rename { publish_new_by_rename(tmp, path, &|| {}) } else { publish_new(tmp, path) },
+                        &|path| fs::remove_file(path),
+                    )
+                    .unwrap(),
+                    b"expected-data",
+                );
+                assert_eq!(count.get(), 1);
+                assert_eq!(stamp(&held), before, "no post-read temp unlink may change the proof's ctime");
+                assert!(same(&held, &File::open(&path).unwrap()));
+                assert_eq!(fs::read(path).unwrap(), expected);
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+        #[test]
+        fn final_verifier_rejects_corruption_and_never_removes_a_replacement() {
+            for swap in [false, true] {
+                let dir = temp(&format!("final-verify-corrupt-{swap}"));
+                let source = dir.join("source.raw");
+                fs::write(&source, b"untouched-original").unwrap();
+                let path = dir.join("output.dng");
+                let result = write_new_unique_verified_with(
+                    &mut std::iter::once(path.clone()),
+                    b"expected-data",
+                    &mut |path, expected| {
+                        if fs::read(path)? != expected {
+                            return Err(io::Error::other("corrupt readback"));
+                        }
+                        Ok(())
+                    },
+                    &same,
+                    &|tmp, path| {
+                        publish_new(tmp, path)?;
+                        if swap {
+                            fs::rename(path, path.with_extension("retired"))?;
+                            fs::write(path, b"expected-data")?;
+                        } else {
+                            fs::write(path, b"corrupt-data!")?;
+                        }
+                        Ok(())
+                    },
+                    &|path| fs::remove_file(path),
+                );
+                assert!(result.is_err());
+                if swap {
+                    assert_eq!(fs::read(path).unwrap(), b"expected-data", "identical bytes from another object are still foreign");
+                } else {
+                    assert!(!path.exists());
+                }
+                assert_eq!(fs::read(source).unwrap(), b"untouched-original");
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+        #[test]
+        fn final_verifier_rejects_a_path_swapped_after_the_read() {
+            let dir = temp("final-verify-late-swap");
+            let path = dir.join("output.dng");
+            let result = write_new_unique_verified(
+                &mut std::iter::once(path.clone()),
+                b"expected-data",
+                &mut |path, expected| {
+                    assert_eq!(fs::read(path)?, expected);
+                    fs::rename(path, path.with_extension("retired"))?;
+                    fs::write(path, b"foreign-bytes")?;
+                    Ok(())
+                },
+                &same,
+            );
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("unproven file left"), "{error}");
+            assert_eq!(fs::read(path).unwrap(), b"foreign-bytes");
+            fs::remove_dir_all(dir).unwrap();
+        }
+        #[test]
+        fn final_verifier_does_not_read_after_temp_alias_cleanup_fails() {
+            let dir = temp("final-verify-temp-failure");
+            let path = dir.join("output.dng");
+            let called = Cell::new(false);
+            let result = write_new_unique_verified_with(
+                &mut std::iter::once(path.clone()),
+                b"expected-data",
+                &mut |_, _| {
+                    called.set(true);
+                    Ok(())
+                },
+                &same,
+                &publish_new,
+                &|_| Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected temp unlink failure")),
+            );
+            assert!(result.is_err());
+            assert!(!called.get());
+            assert!(!path.exists());
+            assert!(names(&dir).is_empty());
+            fs::remove_dir_all(dir).unwrap();
+        }
+        #[test]
+        fn final_verifier_keeps_a_foreign_temp_alias() {
+            let dir = temp("final-verify-temp-swap");
+            let path = dir.join("output.dng");
+            let foreign = std::cell::RefCell::new(None);
+            let result = write_new_unique_verified_with(
+                &mut std::iter::once(path.clone()),
+                b"expected-data",
+                &mut |_, _| -> io::Result<()> { panic!("must not verify with a foreign temp alias") },
+                &same,
+                &|tmp, path| {
+                    publish_new(tmp, path)?;
+                    fs::rename(tmp, dir.join("retired-temp"))?;
+                    fs::write(tmp, b"foreign-temp")?;
+                    foreign.replace(Some(tmp.to_path_buf()));
+                    Ok(())
+                },
+                &|path| fs::remove_file(path),
+            );
+            assert!(result.is_err());
+            assert!(!path.exists());
+            assert_eq!(fs::read(foreign.into_inner().unwrap()).unwrap(), b"foreign-temp");
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
     #[test]
     fn fallback_publish_never_replaces_a_file_that_appears_at_the_same_time() {
         let d = temp("nolink-race");
@@ -398,6 +703,29 @@ mod tests {
     }
 
     #[test]
+    fn same_file_sees_a_hard_link_under_another_name() {
+        let d = temp("same-link");
+        let p = d.join("IMG_1.jpg");
+        fs::write(&p, b"original").unwrap();
+        let linked = d.join("linked.png");
+        match fs::hard_link(&p, &linked) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => panic!("{}: {e}", linked.display()),
+            // no hard links on this volume (FAT/exFAT, some shares), as in `publish_new`
+            Err(e) => {
+                let _ = fs::remove_dir_all(&d);
+                lightcraft_testkit::skip!(System, "no hard links in {}: {e}", d.display());
+                return;
+            }
+        }
+        fs::write(d.join("copy.png"), b"original").unwrap();
+        assert!(same_file(&p, &linked), "a hard link is the same file");
+        assert!(same_file(&linked, &p));
+        assert!(!same_file(&p, &d.join("copy.png")), "a copy with the same content and length is another file");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn same_file_sees_through_other_spellings() {
         let d = temp("same");
         let p = d.join("x.jpg");
@@ -408,5 +736,34 @@ mod tests {
         assert!(!same_file(&p, &d.join("y.jpg")));
         assert!(!same_file(&p, &d.join("missing.jpg")));
         let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn strict_comparison_reports_a_path_it_cannot_query() {
+        let d = temp("strict-query");
+        let p = d.join("x.jpg");
+        fs::write(&p, b"x").unwrap();
+        // A NUL byte makes the metadata lookup fail with an error other than "not found" on
+        // every platform, as a folder the process cannot enter does.
+        let unreadable = Path::new("IMG_1\0.jpg");
+        assert!(same_file_strict(unreadable, &p).is_err());
+        assert!(same_file_strict(&p, unreadable).is_err());
+        assert!(!same_file(unreadable, &p), "the lenient comparison still answers false");
+        assert!(!same_file_strict(&d.join("missing.jpg"), &p).unwrap(), "a missing original is another file");
+        assert!(!same_file_strict(&p.join("under-a-file.jpg"), &p).unwrap());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_zero_file_index_is_not_a_file_identity() {
+        for strict in [false, true] {
+            assert!(same_file_id((7, 42), (7, 42), strict).unwrap());
+            assert!(!same_file_id((7, 42), (7, 43), strict).unwrap());
+            assert!(!same_file_id((7, 42), (8, 42), strict).unwrap());
+        }
+        for (a, b) in [((7, 0), (7, 0)), ((0, 0), (0, 0)), ((7, 42), (7, 0)), ((7, 0), (7, 42))] {
+            assert!(same_file_id(a, b, true).is_err(), "strict comparison must reject an unavailable identity: {a:?}, {b:?}");
+            assert!(!same_file_id(a, b, false).unwrap(), "lenient comparison can fall back to resolved paths");
+        }
     }
 }

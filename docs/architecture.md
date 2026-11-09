@@ -1,6 +1,6 @@
 # Architecture
 
-> **Last reviewed:** 2026-10-10 · **Last updated:** 2026-10-11 · **Change:** minor (`cargo xtask ci` reports the machine and skipped tests; `testkit`) · **Target:** Adobe Lightroom Classic 15.5 / Lightroom 9.6
+> **Last reviewed:** 2026-10-10 · **Target:** Adobe Lightroom Classic 15.5 / Lightroom 9.6 · **Changes:** [revision history](#revision-history)
 
 How LightCraft is built today. The longer design document (`plan/architecture.md`) is local-only
 (`plan/` is gitignored); this page is the committed, current summary. Sizes are Rust lines counted
@@ -13,7 +13,7 @@ L5 depends on egui, eframe, winit or rfd, and that each crate only uses lower la
 
 | Layer | Crates (lines) | Role |
 |---|---|---|
-| L0 | `geom` (1.4k), `color` (0.9k), `raster` (0.8k), `tiff` (2.0k), `fetch` (1.4k), `sysmem` (0.1k) | Matrices and warps, colour spaces and transfer functions, float image buffers, TIFF/IFD read and write, pinned HTTPS model downloads, the one `unsafe` FFI call (`malloc_zone_pressure_relief`) |
+| L0 | `geom` (1.4k), `color` (0.9k), `raster` (0.8k), `tiff` (2.0k), `fetch` (1.4k), `sysmem` (0.1k), `wincolor` (0.3k), `file-identity-sys` | Matrices and warps, colour spaces and transfer functions, float image buffers, TIFF/IFD read and write, pinned HTTPS model downloads, and the three crates with `unsafe` FFI: `malloc_zone_pressure_relief` (macOS), the Win32 calls that read the window's monitor profile (Windows) and the full Windows file-ID query for an open file |
 | L1 | `raw` (22.3k), `codecs` (7.3k), `meta` (4.3k), `develop` (2.5k), `denoise-core` (2.2k), `denoise` (2.7k), `faces` (5.3k), `scenes` (1.0k), `heif` (2.1k, optional) | Raw decoders and demosaic, DNG colour model; standard codecs and encoders; EXIF/XMP/IPTC; the non-destructive edit model and control specs; AI denoise; face detection and recognition; procedural demo photos; HEIC |
 | L2 | `pipeline` (9.8k) | The develop pipeline: scene-referred float, resolution independent; the CPU reference (oracle) for everything else |
 | L3 | `catalog` (11.0k), `gpu` (5.1k), `preview` (1.3k), `merge` (3.8k), `segment` (2.3k) | Library model and persistence; wgpu compute twin of the pipeline; thumbnail/preview cache and job pool; HDR and panorama merge; SAM 3 segmentation |
@@ -50,6 +50,48 @@ L5 depends on egui, eframe, winit or rfd, and that each crate only uses lower la
 4. **Display and export**: display-profile conversion (`docs/display-profiles.md`); export through
    one encoder for app, CLI, MCP and web (`lightcraft_engine::export`).
 
+## Content cache identity
+
+Data caches try a photo's content hash first, then its path and size while the hash is learned.
+Virtual copies resolve their master's physical source identity and retain their own edits.
+A physical replacement or relink durably retires the former and destination path aliases in library
+cache bookkeeping, without changing the catalog format. Source generations reject earlier render,
+face and SAM results; smart-preview and denoise writers check the same source fence at publication. Invalidating a
+persistent alias must succeed before a replacement is applied. Cache cleanup is best-effort:
+a failed deletion cannot re-enable an invalid alias after reopening the library. Current-generation
+work remains usable when its hash is learned; a retired path alias is never restored by learning.
+Failure to persist invalidation clears decoded and denoise inputs and quarantines that source's
+cache identity until a successful replacement. The cache-side marker records the expected
+physical source identity before catalog mutation; primary products are authorized only when the
+resolved source exactly matches it, including after journal replay. Missing or legacy marker
+bodies remain unresolved. An unused marker store is absent; an existing empty store is unresolved
+even without a sentinel. A lost marker store remains conservative across reopen and later invalidations. Marker and sentinel directory-sync errors propagate on Unix;
+Windows retains the persistence helper's best-effort directory durability.
+
+## Whole-original reads
+
+Native whole-original reads go through the session's `originals::Originals` reader, including
+streamed copy, verification and comparisons. Worker jobs capture that reader; synchronous helpers
+require its scoped binding. Standalone operations create a reader explicitly at their boundary.
+Headers, embedded-preview ranges and duplicate head hashes remain partial reads and never establish
+a full fingerprint. A full read hashes the same buffer or stream when the source needs learning or
+validation; it does not open the original a second time. Already authorized hashed sources skip
+incidental hashing. Duplicate retains the operating system's clone/copy path.
+
+Only the owner accepts fingerprints: before commands, after synchronous command work, when results
+arrive, and before saving or closing. Detached export completion also saves, including after a write
+failure or cancellation. Acceptance checks library and photo membership, the source ticket, retained
+handle identity and current file metadata. Missing platform proof withholds learning and cache
+confirmation without failing otherwise successful bytes or copy hashing. A validated no-op read can
+resolve a quarantined expected identity without an undo entry or a new source lifecycle. Cached
+products use their own read's hash; migration keeps authorized old addresses for active readers and
+rewrites a denoise product's bounded key header before publishing its new name. Publication shares
+the replacement fence; staging derived data does not hold that fence. There is no background hasher.
+Windows retains the same READ|DELETE/denyWRITE handle used for bytes and compares its full
+128-bit FileIdInfo plus volume with a fresh current-path handle. The isolated `file-identity-sys`
+helper only borrows that handle; unsupported queries withhold confirmation per source, with no
+legacy 64-bit ID or timestamp fallback. New whole-read entry points need a read-count and owner-learning regression beside their caller.
+
 ## Agent control
 
 Every action is an engine command (id, label, menu path, shortcut, params, enabled, run). The UI,
@@ -62,6 +104,16 @@ dispatch by id, and headless snapshots render the UI without a window.
 `parity` (every id and path cited in [parity-checklist.md](parity-checklist.md) exists), `layers`,
 `assets` (every asset attributed, no Adobe formats) and the WASM build. Other workflows build and
 test FreeBSD and Windows ARM64, lint packaging, and build releases.
+
+The tests run under `cargo test --workspace --lib --bins --tests`, or `cargo nextest run` with the
+same targets when `LIGHTCRAFT_NEXTEST=1` is set and cargo-nextest is installed; doctests run after
+them with `cargo test --workspace --doc`. `cargo test` is the default because the demo library's
+generated scenes are cached per process, and nextest's process per test regenerates them.
+Examples are left out of the test build (clippy `--all-targets` still
+checks them). Each crate links its integration tests into one binary, `tests/it/main.rs` with one
+module per file (`cargo test -p <crate> --test it <module>::`); a test that changes state for its
+whole process (a global allocator, closing the GPU) keeps a binary of its own in `tests/`. The WASM
+build is one `cargo check --target wasm32-unknown-unknown --keep-going` over the wasm-safe crates.
 
 `ci` also probes the machine: OS, CPUs, RAM, the GPU adapters of each backend (from the ignored
 `gpu_probe` test of `lightcraft-gpu`, run after the workspace tests so it reuses their build; xtask
@@ -77,5 +129,7 @@ the `lightcraft-gpu` tests once per backend with a hardware adapter (`LIGHTCRAFT
 
 | Date | Change | Summary |
 |---|---|---|
+| 2026-10-17 | minor | Content cache aliases, virtual-copy identity and durable source replacement fences |
+| 2026-10-23 | minor | Quality gates: one integration-test binary per crate, doctests apart, nextest on request, one WASM check |
 | 2026-10-11 | minor | Quality gates: the CI machine probe, visible skips (`testkit`) and `target/ci/report.json` |
 | 2026-10-10 | major | Created from the code (crate sizes, layers, data model, rendering, control, gates) |

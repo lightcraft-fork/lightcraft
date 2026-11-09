@@ -23,17 +23,20 @@ fn dng_names(path: &str) -> impl Iterator<Item = std::path::PathBuf> {
 ///
 /// The DNG is checked before anyone relies on it (Convert to DNG relinks the photo to it, Copy as
 /// DNG deletes the raw copy): the encoded file must decode to the same raw data, and it is
-/// written to a temp file, synced, read back identical and only then given its name — never
-/// replacing an existing file. On any failure no DNG is left behind and the raw stays in use.
+/// written to a synced temp file and then given a name no other file has (never replacing one);
+/// the named file is read back and checked before any catalog change or removal of the raw copy.
+/// On any failure the raw stays in use, and only a DNG that is still the one written is removed.
 pub(crate) fn write_dng_for(s: &Session, path: &str, packet: String) -> std::result::Result<String, String> {
-    write_dng_with(s.media.file_bytes.as_ref(), path, packet)
+    let reader = s.media.file_bytes.clone().unwrap_or_else(|| s.originals.reader());
+    write_dng_with(Some(&reader), path, packet)
 }
 
 /// [`write_dng_for`] without the session (imports convert on a worker thread).
 pub(crate) fn write_dng_with(file_bytes: Option<&crate::merge::ByteReader>, path: &str, packet: String) -> std::result::Result<String, String> {
+    let _binding = crate::originals::standalone_binding();
     let bytes = match file_bytes {
         Some(r) => r(path)?,
-        None => std::fs::read(path).map_err(|e| format!("{path}: {e}"))?,
+        None => crate::originals::Originals::default().read_whole(path).map_err(|e| format!("{path}: {e}"))?.0,
     };
     let mut raw = lightcraft_raw::decode(&bytes).map_err(|e| format!("{path}: {e}"))?;
     crate::camera_preview::with_starting_colour(&mut raw, &bytes);
@@ -52,9 +55,16 @@ pub(crate) fn write_dng_with(file_bytes: Option<&crate::merge::ByteReader>, path
         return Err(format!("{path}: the DNG written for it doesn't hold the same raw data; the raw is kept"));
     }
     drop((raw, back));
-    let out = lightcraft_catalog::safe_file::write_new_unique(&mut dng_names(path), &dng)
-        .map_err(|e| format!("{path}: could not write its DNG ({e}); the raw is kept"))?;
-    Ok(out.to_string_lossy().to_string())
+    let (out, fp) = lightcraft_catalog::safe_file::write_new_unique_verified(
+        &mut dng_names(path),
+        &dng,
+        &mut crate::originals::verify_generated,
+        &crate::originals::same_file_handles,
+    )
+    .map_err(|e| format!("{path}: could not write its DNG ({e}); the raw is kept"))?;
+    let out = out.to_string_lossy().to_string();
+    crate::originals::record_generated(&out, &dng, fp)?;
+    Ok(out)
 }
 
 fn convert(s: &mut Session, p: &Value) -> Result<Value> {
@@ -83,8 +93,10 @@ fn convert(s: &mut Session, p: &Value) -> Result<Value> {
             continue;
         }
         let packet = crate::sidecar::sidecar_packet(&ph, &s.catalog);
+        let capture = crate::originals::ReadCapture::new();
         match write_dng_for(s, path, packet) {
             Ok(out) => {
+                let output = capture.fingerprint(&out).and_then(|fp| fp.probe_info());
                 let file_name = Path::new(&out).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                 // virtual copies of this photo follow it to the DNG
                 for c in s.catalog.photos().filter(|c| c.copy_of == Some(id)) {
@@ -96,6 +108,19 @@ fn convert(s: &mut Session, p: &Value) -> Result<Value> {
                     });
                 }
                 ops.push(Op::Relink { id, file_name, source: Source::File { path: out.clone() }, format: Some("DNG".into()) });
+                if let Some(info) = output {
+                    for target in s.catalog.photos().filter(|p| p.id == id || p.copy_of == Some(id)) {
+                        ops.push(Op::SetContent {
+                            id: target.id,
+                            width: info.width,
+                            height: info.height,
+                            file_size: info.file_size,
+                            content_hash: None,
+                            preview_only: info.preview_only.clone(),
+                            preview_checked: lightcraft_catalog::preview_stamp(&info.preview_only),
+                        });
+                    }
+                }
                 converted.push(json!({"id": id.0, "path": out, "original": path}));
             }
             Err(e) => skipped.push(json!([id.0, e])),
@@ -204,13 +229,11 @@ fn edit_copy(s: &mut Session, p: &Value, id: lightcraft_catalog::PhotoId, opts: 
 /// `None` when nothing changed. Covers a raw that became decodable (or stopped being: a different
 /// file relinked), i.e. a change of [`lightcraft_catalog::Photo::preview_only`], and a
 /// preview-only photo this version hasn't checked yet: its stamp is refreshed so it isn't probed
-/// again (see [`lightcraft_catalog::Photo::preview_checked`]). A photo with no hash on record
-/// (added from its headers, as a Lightroom catalog's originals are) is not changed by the probe
-/// having one: its size, dimensions and preview state decide, so a Reload of the same file adds no
-/// undo step and keeps its previews (their key is the path and size while there is no hash).
+/// again (see [`lightcraft_catalog::Photo::preview_checked`]).
 pub(crate) fn content_op(id: lightcraft_catalog::PhotoId, ph: &lightcraft_catalog::Photo, info: crate::media::ProbeInfo) -> Option<Op> {
-    let preview_checked = lightcraft_catalog::preview_stamp(&info.preview_only);
-    let same = (ph.content_hash.is_none() || info.content_hash == ph.content_hash)
+    let preview_checked = ph.preview_stamp(&info.preview_only);
+    let same = (ph.content_hash.is_none()
+        || info.content_hash.as_deref().map(crate::sync::base_hash) == ph.content_hash.as_deref().map(crate::sync::base_hash))
         && info.file_size == ph.file_size
         && (info.width, info.height) == (ph.width, ph.height)
         && info.preview_only == ph.preview_only
@@ -236,12 +259,23 @@ fn fill_missing_meta(id: lightcraft_catalog::PhotoId, ph: &lightcraft_catalog::P
     if m.lens.is_empty() {
         m.lens = src.lens.clone();
     }
+    if m.make.is_empty() {
+        m.make = src.make.clone();
+    }
+    if m.lens_make.is_empty() {
+        m.lens_make = src.lens_make.clone();
+    }
     if m.shutter.is_empty() {
         m.shutter = src.shutter.clone();
     }
     m.focal_mm = m.focal_mm.or(src.focal_mm);
     m.aperture = m.aperture.or(src.aperture);
     m.iso = m.iso.or(src.iso);
+    m.flash = m.flash.or(src.flash);
+    m.exposure_bias = m.exposure_bias.or(src.exposure_bias);
+    if m.serial_number.is_empty() {
+        m.serial_number = src.serial_number.clone();
+    }
     m.gps = m.gps.or(src.gps);
     // the camera's focus point: photos imported before it was read get it here
     if m.focus.is_none() {
@@ -304,8 +338,8 @@ pub(crate) fn reload_ops(
         ops.append(&mut mine);
         changed.push(id);
     }
-    // virtual copies share the file
-    for c in cat.photos().filter(|c| c.copy_of == Some(id)) {
+    // every record of this file (virtual copies, other records of the same path) shares its content
+    for c in cat.photos().filter(|c| c.id != id && c.source == ph.source) {
         let theirs: Vec<Op> =
             content_op(c.id, c, info.clone()).into_iter().chain(lens_ops(c.id, c, info)).chain(as_shot_wb_op(c.id, c, info)).collect();
         if !theirs.is_empty() {
@@ -316,30 +350,15 @@ pub(crate) fn reload_ops(
 }
 
 /// Re-read photos whose files changed on disk (an external editor saved them): new size,
-/// dimensions and content hash, cached sources dropped. → {reloaded: [ids]}
+/// dimensions and content hash, cached sources dropped. The app runs the same steps
+/// ([`crate::cmd::reload`]) with the files read on a worker thread. → {reloaded: [ids]}
 fn reload(s: &mut Session, p: &Value) -> Result<Value> {
-    let ids = s.targets(p)?;
-    let paths: Vec<(lightcraft_catalog::PhotoId, String)> = ids
-        .iter()
-        .filter_map(|id| match s.catalog.photo(*id).map(|ph| ph.source.clone()) {
-            Some(Source::File { path }) => Some((*id, path)),
-            _ => None,
-        })
-        .collect();
-    let probed = crate::import::probe_paths(s, &paths.iter().map(|(_, p)| p.clone()).collect::<Vec<_>>());
-    let mut ops = Vec::new();
-    let mut reloaded = Vec::new();
-    for ((id, _), info) in paths.into_iter().zip(probed) {
-        let Ok(info) = info else { continue };
-        reload_ops(&s.catalog, id, &info, &mut ops, &mut reloaded);
-    }
-    for id in &reloaded {
-        s.media.forget(*id);
-    }
-    if !ops.is_empty() {
-        s.commit("Reload Changed Files", Op::Batch { ops })?;
-    }
-    Ok(json!({"reloaded": reloaded.iter().map(|i| i.0).collect::<Vec<_>>()}))
+    use crate::cmd::reload as r;
+    let items = r::plan(s, p)?;
+    let probe = r::file_probe(s);
+    let results = r::probe(probe.as_ref(), &items, &std::sync::atomic::AtomicBool::new(false), &|_| {});
+    let reloaded = r::apply(s, items, results)?;
+    Ok(r::to_json(&reloaded))
 }
 
 /// Duplicate: copy the file next to itself (`<name>-copy`, never overwriting) and add it with the
@@ -367,7 +386,11 @@ fn duplicate(s: &mut Session, p: &Value) -> Result<Value> {
         q.source = Source::File { path: dst.to_string_lossy().to_string() };
         q.file_name = dst.file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or_default();
         // the same bytes, but its own photo: no duplicate-content clash, no shared history
-        q.content_hash = q.content_hash.map(|h| format!("{h}:dup{}", new.0));
+        let physical = s.physical_photo(id).filter(|_| s.source_hash_authorized(id));
+        q.content_hash = physical.as_ref().and_then(|m| m.content_hash.as_ref()).map(|h| format!("{h}:dup{}", new.0));
+        if let Some(m) = &physical {
+            (q.file_size, q.width, q.height) = (m.file_size, m.width, m.height);
+        }
         q.copy_of = None;
         q.copy_name = None;
         q.history.clear();
@@ -404,7 +427,7 @@ pub fn edit_specs() -> Vec<CommandSpec> {
             "Reload from Disk",
             ["Photo"],
             None,
-            "{ids?} — re-read photos whose files changed on disk (e.g. saved by an external editor), or raws shown from their embedded preview that can be decoded now; camera fields the catalog lacks are filled in, and so is the lens data the file carries (an untouched photo then gets its lens correction turned on as import would; an edited one keeps its settings) → {reloaded}",
+            "{ids?} — re-read photos whose files changed on disk (e.g. saved by an external editor), or raws shown from their embedded preview that can be decoded now; camera fields the catalog lacks are filled in, and so is the lens data the file carries (an untouched photo then gets its lens correction turned on as import would; an edited one keeps its settings); in the app the files are read in the background (activity row `reload`, cancellable) and the reply is {background: true, count} unless `wait: true` → {reloaded}",
             has_selection,
             reload
         ),
@@ -424,6 +447,31 @@ pub fn edit_specs() -> Vec<CommandSpec> {
 mod tests {
     use super::*;
     use lightcraft_catalog::{Photo, PhotoId, Source};
+
+    #[test]
+    fn duplicating_a_virtual_copy_takes_its_files_current_identity() {
+        let dir = crate::tests_xmp::temp_dir("duplicate-copy-identity");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.jpg");
+        std::fs::write(&path, b"now").unwrap();
+        let mut s = Session::new();
+        let mut master = Photo::new(PhotoId(1), Source::File { path: path.to_string_lossy().into() }, "a.jpg", "JPEG", 60, 40, "2026-01-01");
+        master.content_hash = Some("now".into());
+        master.file_size = 3;
+        let mut copy = master.clone();
+        copy.id = PhotoId(2);
+        copy.copy_of = Some(master.id);
+        copy.content_hash = Some("before".into());
+        copy.file_size = 9;
+        s.catalog.apply(Op::AddPhoto { photo: Box::new(master) }).unwrap();
+        s.catalog.apply(Op::AddPhoto { photo: Box::new(copy) }).unwrap();
+        s.selection = crate::Selection { active: Some(PhotoId(2)), ids: vec![PhotoId(2)] };
+        let r = s.execute("photo.duplicate", &serde_json::json!({"ids": [2]})).unwrap();
+        let new = s.catalog.photo(PhotoId(r["ids"][0].as_u64().unwrap())).unwrap();
+        assert_eq!(new.content_hash.as_deref().and_then(|h| h.split_once(":dup")).map(|(base, _)| base), Some("now"));
+        assert_eq!(new.file_size, 3);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// Reload fills camera fields a photo lacks (a CR3 imported before CR3 metadata was read) and keeps
     /// everything already set.
@@ -474,6 +522,7 @@ mod tests {
             warp: Some(lightcraft_develop::EmbeddedWarp { planes: [[1.0, -0.1, 0.03, 0.0, 0.0, 0.0]; 3], ..Default::default() }),
             vignette: None,
             stages: Default::default(),
+            source: Default::default(),
         }
     }
     fn old_rw2() -> lightcraft_catalog::Photo {

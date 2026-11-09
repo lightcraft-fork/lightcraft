@@ -29,7 +29,9 @@ impl Drop for Headless {
 
 impl Default for Headless {
     fn default() -> Self {
-        let session = Session::new().with_fs().with_default_denoise_models().with_system_clock().with_default_face_models();
+        // the lens database the desktop app downloaded, when it is there (a headless session never fetches it)
+        let session =
+            Session::new().with_fs().with_default_denoise_models().with_system_clock().with_default_face_models().with_default_lens_database();
         Self::new(session.with_default_sam3_model().with_default_slide_templates())
     }
 }
@@ -61,16 +63,13 @@ impl Headless {
     /// With `path` and no `format`, the format follows the path's extension.
     fn export(&mut self, p: &Value) -> Result<Value, String> {
         use lightcraft_engine::export::{Destination, ExportFormat, ExportOptions, Resize, prepare_batch, run_batch};
-        let p = &self.session.export_params(p)?;
-        let mut opts = ExportOptions::from_params(p).map_err(|e| e.to_string())?;
+        let p = &self.session.export_params_or(p, ExportFormat::Png)?;
+        // PNG for a `path` that names no format; `bitDepth` is checked against the format written
+        let mut opts = ExportOptions::from_params_or(p, ExportFormat::Png).map_err(|e| e.to_string())?;
         if !ExportOptions::has_size_param(p) {
             opts.resize = Some(Resize::long_edge(3000));
         }
         let exact = p.get("path").and_then(Value::as_str);
-        if let (Some(path), None) = (exact, p.get("format")) {
-            let ext = Path::new(path).extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
-            opts.format = ExportFormat::parse(&ext).unwrap_or(ExportFormat::Png);
-        }
         let ids: Vec<_> = match p.get("ids").and_then(Value::as_array) {
             Some(a) => a.iter().filter_map(|v| serde_json::from_value(v.clone()).ok()).collect(),
             // like the desktop app: the selection (in grid order), else the given / active photo
@@ -99,7 +98,9 @@ impl Headless {
                 cancelled = hook.as_mut().is_some_and(|h| !h(done, total, name));
                 !cancelled
             },
-        )?;
+        );
+        let save_error = self.session.persist().err().map(|e| e.to_string());
+        let files = files?;
         if !cancelled && let Some(hook) = hook.as_mut() {
             cancelled = !hook(total, total, "");
         }
@@ -112,6 +113,9 @@ impl Headless {
             out["applePhotos"] = photos;
         }
         out["files"] = json!(files);
+        if let Some(error) = save_error {
+            out["saveError"] = json!(error);
+        }
         Ok(out)
     }
 }
@@ -135,7 +139,7 @@ impl Backend for Headless {
             "engine.commands" => {
                 let mut v: Vec<Value> = self.session.commands().into_iter().map(|c| serde_json::to_value(c).unwrap_or_default()).collect();
                 v.push(json!({"id": "app.export", "label": "Export Now", "menu": [], "shortcut": null,
-                    "params": "{path?: output file (.jpg/.png/.tif/.webp/.avif/.jxl/.psd/.dng) | dir?, ids?, preset?, format?: jpeg|png|tiff|webp|avif|jxl|psd|dng|original, longEdge?|shortEdge?|width?|height?|megapixels?|percent? (default longEdge 3000; longEdge 0 = full size), dontEnlarge?, ppi?, quality?: 1..100, jxlLossless?, jxlEffort?: fast|normal, jxlProgressive?, limitKb?, colorSpace?: srgb|displayP3|adobeRgb|proPhoto|rec2020, bitDepth?: 8|10|16|32, hdr? (HDR output for HDR edits: gain map JPEG, PQ AVIF / PNG / JPEG XL, float TIFF), sharpen?: none|screen|matte|glossy, sharpenAmount?: low|standard|high, metadata?: all|allExceptCamera|copyright|none, removeLocation?, naming?, startNumber?, destinationMode?: specificFolder|sameAsOriginal (sameAsOriginal = each photo into its original's folder; `dir` unused), subfolder?, conflict?: unique|overwrite|skip, tiffCompression?: none|lzw|zip, dngCompression?: lossless|deflate|uncompressed, addToPhotos?: bool (macOS: then add the files written to Apple Photos; outcome in `applePhotos`), photosAlbum?: top-level album name (made when missing), watermark?: text | {text?, vertical? (upright columns, right to left), size? (text height, 0.005..0.5 of the short edge; default 0.035), opacity? (0..1; 0.7), anchor?: topLeft|top|topRight|left|center|right|bottomLeft|bottom|bottomRight, insetX? (margin from the left/right edge, 0..0.4 of the short edge; 0.025), insetY? (from the top/bottom edge; 0.025), inset? (sets both), rotation?: 0|90|180|270 (degrees clockwise; 0), color? [r,g,b] sRGB, shadow?, image? (graphic drawn instead of the text), imageWidth? (0.01..1 of the photo's width; 0.2)}} — an unknown parameter, an out-of-range watermark size or a value of the wrong kind is an error, not a default",
+                    "params": "{path?: output file (.jpg/.png/.tif/.webp/.avif/.jxl/.psd/.dng) | dir?, ids?, preset?, format?: jpeg|png|tiff|webp|avif|jxl|psd|dng|original, longEdge?|shortEdge?|width?|height?|megapixels?|percent? (default longEdge 3000; longEdge 0 = full size), fit?: dimensions|widthHeight (with width + height: dimensions fits either orientation, widthHeight limits the width to `width` and the height to `height`), dontEnlarge?, ppi?, quality?: 1..100, jxlLossless?, jxlEffort?: fast|normal, jxlProgressive?, limitKb?, colorSpace?: srgb|displayP3|adobeRgb|proPhoto|rec2020, bitDepth?: 8|10|16|32, hdr? (HDR output for HDR edits: gain map JPEG, PQ AVIF / PNG / JPEG XL, float TIFF), sharpen?: none|screen|matte|glossy, sharpenAmount?: low|standard|high, metadata?: all|allExceptCamera|copyright|none, removeLocation?, naming?, startNumber?, destinationMode?: specificFolder|sameAsOriginal (sameAsOriginal = each photo into its original's folder; `dir` unused), subfolder?, conflict?: unique|overwrite|skip, tiffCompression?: none|lzw|zip (default zip; lzw is usually larger and slower than zip, at 16 bit often larger than none: only for software that needs LZW), dngCompression?: lossless|deflate|uncompressed, addToPhotos?: bool (macOS: then add the files written to Apple Photos; outcome in `applePhotos`), photosAlbum?: top-level album name (made when missing), watermark?: text | {text?, vertical? (upright columns, right to left), size? (text height, 0.005..0.5 of the short edge; default 0.035), opacity? (0..1; 0.7), anchor?: topLeft|top|topRight|left|center|right|bottomLeft|bottom|bottomRight, insetX? (margin from the left/right edge, 0..0.4 of the short edge; 0.025), insetY? (from the top/bottom edge; 0.025), inset? (sets both), rotation?: 0|90|180|270 (degrees clockwise; 0), color? [r,g,b] sRGB, shadow?, image? (graphic drawn instead of the text), imageWidth? (0.01..1 of the photo's width; 0.2)}} — an unknown parameter, an out-of-range watermark size or a value of the wrong kind is an error, not a default",
                     "enabled": self.session.active().is_some()}));
                 Ok(Value::Array(v))
             }
@@ -206,6 +210,37 @@ pub fn write_image(path: &Path, img: &Rgba8, quality: u8) -> Result<(), String> 
 mod tests {
     use super::*;
 
+    /// A headless session reads the lens database the desktop app downloaded, as the desktop does (the same raw gets
+    /// the same profile everywhere), but never fetches it by itself.
+    #[test]
+    fn a_headless_session_reads_the_downloaded_lens_database() {
+        let h = Headless::default();
+        assert_eq!(lightcraft_engine::lens_profiles::host_dir(), lightcraft_engine::lensfun_download::default_dir());
+        assert!(!h.session.lens_auto_download, "selecting it is not permission to download it");
+    }
+
+    #[test]
+    fn folder_discovery_matches_engine_extensions() {
+        let dir = std::env::temp_dir().join(format!("lc-mcp-discovery-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let nested = dir.join("trip").join("day2"); // not "trip/day2": discovery yields the platform's separator
+        std::fs::create_dir_all(&nested).unwrap();
+        let mut expected = Vec::new();
+        for ext in lightcraft_engine::import::EXTENSIONS {
+            for (folder, name) in [(&dir, format!("lower.{ext}")), (&nested, format!("upper.{}", ext.to_ascii_uppercase()))] {
+                let path = folder.join(name);
+                std::fs::write(&path, b"discovery only, not a decoded photo").unwrap();
+                expected.push(path.to_string_lossy().into_owned());
+            }
+        }
+        std::fs::write(nested.join("notes.txt"), b"not a photo").unwrap();
+        let mut found = expand_paths(&[dir.to_string_lossy().into_owned()]);
+        expected.sort();
+        found.sort();
+        assert_eq!(found, expected);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// Headless sessions look for the SAM 3 model where the desktop app does, and `segment.model.status` reports it (issue #619).
     #[test]
     fn headless_sessions_get_the_sam3_model_folder() {
@@ -267,6 +302,52 @@ mod tests {
             .call("engine.execute", json!({"command": "app.export", "params": {"dir": dir.to_string_lossy(), "longEdge": 64, "format": "png"}}))
             .unwrap();
         assert_eq!(r["files"].as_array().map(Vec::len), Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A catalog store whose appends fail (a full disk).
+    #[derive(Clone)]
+    struct FullDisk(lightcraft_engine::catalog::MemStore);
+
+    impl lightcraft_engine::catalog::Store for FullDisk {
+        fn read(&mut self, name: &str) -> std::io::Result<Option<Vec<u8>>> {
+            self.0.read(name)
+        }
+        fn write_atomic(&mut self, name: &str, data: &[u8]) -> std::io::Result<()> {
+            self.0.write_atomic(name, data)
+        }
+        fn append(&mut self, _: &str, _: &[u8]) -> std::io::Result<()> {
+            Err(std::io::Error::other("disk full"))
+        }
+        fn truncate(&mut self, name: &str, len: u64) -> std::io::Result<()> {
+            self.0.truncate(name, len)
+        }
+        fn describe(&self) -> String {
+            "full disk".into()
+        }
+    }
+
+    /// An export whose files were written reports them, and the save that failed after it beside them.
+    #[test]
+    fn an_export_reports_its_files_when_the_save_after_it_fails() {
+        let dir = std::env::temp_dir().join(format!("lc-mcp-export-unsaved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut session = Session::new();
+        let catalog = Box::new(FullDisk(lightcraft_engine::catalog::MemStore::new()));
+        let files = Box::new(lightcraft_engine::catalog::MemStore::new());
+        let stores = lightcraft_engine::library::LibraryStores { dir: "full".into(), catalog, files, on_disk: false };
+        session.open_library_in(stores, true).unwrap();
+        let mut h = Headless::new(session);
+        let id = h.session.selection.active.unwrap().0;
+        assert!(h.call("engine.execute", json!({"command": "photo.rate", "params": {"ids": [id], "rating": 2}})).is_err());
+        let r = h
+            .call(
+                "engine.execute",
+                json!({"command": "app.export", "params": {"ids": [id], "dir": dir.to_string_lossy(), "longEdge": 32, "format": "png"}}),
+            )
+            .unwrap();
+        assert_eq!(r["files"].as_array().map(Vec::len), Some(1), "{r}");
+        assert!(r["saveError"].as_str().is_some_and(|e| e.contains("disk full")), "{r}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

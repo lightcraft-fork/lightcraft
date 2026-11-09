@@ -232,6 +232,62 @@ pub fn poll_photos(app: &mut LightcraftApp, ctx: &egui::Context) {
 #[cfg(target_arch = "wasm32")]
 pub fn poll_photos(_: &mut LightcraftApp, _: &egui::Context) {}
 
+/// What a finished export says: how many files were written, skipped or failed, and the Apple Photos note.
+fn export_summary(files: &[Value], photos: Option<&Value>, total: usize, cancelled: bool) -> String {
+    let sheet = files.first().filter(|f| f["contactSheet"] == true);
+    let ok = files.iter().filter(|f| f.get("path").is_some()).count();
+    let failed: Vec<&Value> = files.iter().filter(|f| f.get("error").is_some()).collect();
+    let skipped = files.iter().filter(|f| f.get("skipped").is_some()).count();
+    let mut m = crate::i18n::tr_format!("Exported {ok} of {total} photo{}", if total == 1 { "" } else { "s" }, ok = ok, total = total);
+    if let Some(sheet) = sheet {
+        m = format!("Exported contact sheet: {} photos, {} pages", sheet["photos"], sheet["pages"]);
+    }
+    if let Some(pdf) = files.first().filter(|f| f["print"] == true) {
+        m = format!("Printed to PDF: {} photos, {} pages", pdf["photos"], pdf["pages"]);
+    }
+    if skipped > 0 {
+        m += &crate::i18n::tr_format!(" · {skipped} skipped (file exists)", skipped = skipped);
+    }
+    if let Some(first) = failed.first() {
+        m += &crate::i18n::tr_format!(" · {} failed: {}", failed.len(), first["error"].as_str().unwrap_or("error"));
+    }
+    if cancelled {
+        m += " · cancelled";
+    }
+    if let Some(photos) = photos {
+        m += " · ";
+        m += &apple_photos_note(photos);
+    }
+    m
+}
+
+/// The message for a finished export, and its result kept as `last` (a failed export keeps the one before). A save
+/// that failed after it is added to both, and only to this export's own result.
+fn finished(
+    last: &mut Option<Value>,
+    r: Result<(Vec<Value>, Option<Value>, bool), String>,
+    saved: Result<(), String>,
+    total: usize,
+    cancelled: bool,
+) -> String {
+    let mut msg = match r {
+        Ok((files, photos, _)) => {
+            let m = export_summary(&files, photos.as_ref(), total, cancelled);
+            let mut result = json!({"files": files, "cancelled": cancelled, "applePhotos": photos});
+            if let Err(error) = &saved {
+                result["saveError"] = json!(error);
+            }
+            *last = Some(result);
+            m
+        }
+        Err(e) => e,
+    };
+    if let Err(error) = saved {
+        msg += &format!(" · {error}");
+    }
+    msg
+}
+
 /// Per frame: keep the activity row up to date; when the batch finishes, report it.
 pub fn poll(app: &mut LightcraftApp, ctx: &egui::Context) {
     let Some(task) = &app.export else { return };
@@ -242,38 +298,8 @@ pub fn poll(app: &mut LightcraftApp, ctx: &egui::Context) {
             app.export = None;
             // Photos refused (permission, not installed…): leave the way out on screen longer
             let photos_failed = matches!(&r, Ok((_, Some(p), _)) if p.get("error").is_some());
-            let msg = match r {
-                Ok((files, photos, _)) => {
-                    let sheet = files.first().filter(|f| f["contactSheet"] == true);
-                    let ok = files.iter().filter(|f| f.get("path").is_some()).count();
-                    let failed: Vec<&Value> = files.iter().filter(|f| f.get("error").is_some()).collect();
-                    let skipped = files.iter().filter(|f| f.get("skipped").is_some()).count();
-                    let mut m =
-                        crate::i18n::tr_format!("Exported {ok} of {total} photo{}", if total == 1 { "" } else { "s" }, ok = ok, total = total);
-                    if let Some(sheet) = sheet {
-                        m = format!("Exported contact sheet: {} photos, {} pages", sheet["photos"], sheet["pages"]);
-                    }
-                    if let Some(pdf) = files.first().filter(|f| f["print"] == true) {
-                        m = format!("Printed to PDF: {} photos, {} pages", pdf["photos"], pdf["pages"]);
-                    }
-                    if skipped > 0 {
-                        m += &crate::i18n::tr_format!(" · {skipped} skipped (file exists)", skipped = skipped);
-                    }
-                    if let Some(first) = failed.first() {
-                        m += &crate::i18n::tr_format!(" · {} failed: {}", failed.len(), first["error"].as_str().unwrap_or("error"));
-                    }
-                    if cancelled {
-                        m += " · cancelled";
-                    }
-                    if let Some(photos) = &photos {
-                        m += " · ";
-                        m += &apple_photos_note(photos);
-                    }
-                    app.last_export_result = Some(json!({"files": files, "cancelled": cancelled, "applePhotos": photos}));
-                    m
-                }
-                Err(e) => e,
-            };
+            let saved = app.session.persist().map_err(|e| e.to_string());
+            let msg = finished(&mut app.last_export_result, r, saved, total, cancelled);
             if photos_failed {
                 app.toast_for(ctx, msg, 15.0);
             } else {
@@ -287,8 +313,35 @@ pub fn poll(app: &mut LightcraftApp, ctx: &egui::Context) {
         }
         Err(std::sync::mpsc::TryRecvError::Disconnected) => {
             app.export = None;
-            app.toast(ctx, crate::i18n::tr("Export stopped unexpectedly"));
+            let mut message = crate::i18n::tr("Export stopped unexpectedly").to_string();
+            if let Err(error) = app.session.persist() {
+                message += &format!(" · {error}");
+            }
+            app.toast(ctx, message);
         }
+    }
+}
+
+#[cfg(test)]
+mod finished_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_export_leaves_the_previous_result_without_its_save_error() {
+        let mut last = None;
+        finished(&mut last, Ok((vec![json!({"path": "a.jpg"})], None, false)), Ok(()), 1, false);
+        let msg = finished(&mut last, Err("render failed".into()), Err("disk full".into()), 1, false);
+        assert!(msg.contains("render failed") && msg.contains("disk full"), "{msg}");
+        let last = last.unwrap();
+        assert!(last.get("saveError").is_none(), "{last}");
+        assert_eq!(last["files"][0]["path"], "a.jpg");
+    }
+
+    #[test]
+    fn a_save_that_fails_after_an_export_is_in_its_result() {
+        let mut last = None;
+        finished(&mut last, Ok((vec![json!({"path": "a.jpg"})], None, false)), Err("disk full".into()), 1, false);
+        assert_eq!(last.unwrap()["saveError"], "disk full");
     }
 }
 

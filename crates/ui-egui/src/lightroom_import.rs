@@ -52,6 +52,8 @@ pub struct LightroomTask {
     guard: TaskGuard,
     /// The import being added (from the worker's `Started` on).
     import: Option<lightcraft_engine::lightroom_job::LightroomImport>,
+    /// Writes the import index after each batch of virtual copies (from the first one on).
+    index_writer: Option<IndexWriter>,
 }
 
 impl LightroomTask {
@@ -69,7 +71,7 @@ impl LightroomTask {
             Kind::Import => "Importing Lightroom catalog",
         };
         let guard = s.activity.start("lightroom", label, Cancel::Flag(cancel.clone()));
-        let task = Self { kind, path, cancel, progress, rx, phase: Phase::Reading, cancelled: false, guard, import: None };
+        let task = Self { kind, path, cancel, progress, rx, phase: Phase::Reading, cancelled: false, guard, import: None, index_writer: None };
         task.refresh();
         task
     }
@@ -148,6 +150,22 @@ impl Drop for LightroomTask {
 #[cfg(target_arch = "wasm32")]
 fn unsupported_wasm() -> Result<Value, String> {
     Err("Lightroom catalog import is unavailable in browser builds; open the catalog in the native LightCraft app".into())
+}
+
+/// Tests: a catalog import that never ends while the returned value lives, so a drop meets it pending.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) fn stall_import(app: &mut LightcraftApp) -> Box<dyn std::any::Any> {
+    let (tx, rx) = mpsc::channel::<Message>();
+    let task = LightroomTask::new(
+        &app.session,
+        Kind::Import,
+        PathBuf::from("catalog.lrcat"),
+        Arc::new(AtomicBool::new(false)),
+        LightroomProgress::default(),
+        rx,
+    );
+    app.lightroom = Some(task);
+    Box::new(tx)
 }
 
 /// Whether a Lightroom task currently owns the catalog transition.
@@ -240,12 +258,16 @@ fn spawn_prepare(
 #[cfg(not(target_arch = "wasm32"))]
 fn spawn_finalize(
     finalization: lightcraft_engine::lightroom_job::LightroomArchiveFinalization,
+    previous: Option<std::thread::JoinHandle<()>>,
     tx: mpsc::Sender<Message>,
     ctx: egui::Context,
 ) -> Result<(), String> {
     std::thread::Builder::new()
         .name("lc-lightroom-finalize".into())
         .spawn(move || {
+            if let Some(previous) = previous {
+                let _ = previous.join();
+            }
             let result = lightcraft_engine::guard::catch("Lightroom archive finalization", || finalization.finish())
                 .and_then(|r| r.map_err(|e| e.to_string()));
             let _ = tx.send(Message::Finalized(result));
@@ -258,19 +280,115 @@ fn spawn_finalize(
 #[cfg(target_arch = "wasm32")]
 fn spawn_finalize(
     _finalization: lightcraft_engine::lightroom_job::LightroomArchiveFinalization,
+    _previous: Option<std::thread::JoinHandle<()>>,
     _tx: mpsc::Sender<Message>,
     _ctx: egui::Context,
 ) -> Result<(), String> {
     unsupported_wasm().map(|_| ())
 }
 
+/// Write the import index (`write`), logging a failure: the final write, which comes after this
+/// one, writes the whole index again and reports one.
+fn write_index(write: lightcraft_engine::lightroom_job::LightroomArchiveFinalization) {
+    let written = lightcraft_engine::guard::catch("Lightroom import index", || write.finish()).and_then(|r| r.map_err(|e| e.to_string()));
+    if let Err(e) = written {
+        log::warn!("Lightroom import index: {e}");
+    }
+}
+
+type IndexJob = Box<dyn FnOnce() + Send>;
+
+/// What waits for the index writer: the newest write, and whether to stop.
+#[derive(Default)]
+struct IndexQueue {
+    next: Option<IndexJob>,
+    closed: bool,
+}
+
+/// One worker that writes the import index after each batch of virtual copies, in order. A
+/// newer index replaces one still waiting (it holds every identity of the older one), so however
+/// fast the batches come, one write runs and at most one waits. With no worker (none could start)
+/// each write runs where it is handed in.
+struct IndexWriter {
+    queue: Arc<(std::sync::Mutex<IndexQueue>, std::sync::Condvar)>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
+
+impl IndexWriter {
+    fn start() -> Self {
+        let queue: Arc<(std::sync::Mutex<IndexQueue>, std::sync::Condvar)> = Arc::default();
+        let shared = queue.clone();
+        let worker = std::thread::Builder::new()
+            .name("lc-lightroom-index".into())
+            .spawn(move || {
+                let (lock, ready) = &*shared;
+                loop {
+                    let job = {
+                        let mut queue = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        loop {
+                            if let Some(job) = queue.next.take() {
+                                break Some(job);
+                            }
+                            if queue.closed {
+                                break None;
+                            }
+                            queue = ready.wait(queue).unwrap_or_else(std::sync::PoisonError::into_inner);
+                        }
+                    };
+                    match job {
+                        Some(job) => job(),
+                        None => return,
+                    }
+                }
+            })
+            .ok();
+        Self { queue, worker }
+    }
+
+    /// Write after the write before it (in place of one that still waits).
+    fn write(&mut self, job: impl FnOnce() + Send + 'static) {
+        if self.worker.is_none() {
+            job();
+            return;
+        }
+        let (lock, ready) = &*self.queue;
+        lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).next = Some(Box::new(job));
+        ready.notify_one();
+    }
+
+    /// Stop for the final write, which holds every identity: a write still waiting is dropped, and
+    /// the one running is returned to wait for.
+    fn close(mut self) -> Option<std::thread::JoinHandle<()>> {
+        let (lock, ready) = &*self.queue;
+        {
+            let mut queue = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            queue.next = None;
+            queue.closed = true;
+        }
+        ready.notify_one();
+        self.worker.take()
+    }
+}
+
+impl Drop for IndexWriter {
+    /// (without a final write, a write still waiting is made before the worker stops)
+    fn drop(&mut self) {
+        let (lock, ready) = &*self.queue;
+        lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).closed = true;
+        ready.notify_one();
+    }
+}
+
+/// What `status` and the result window show for an inspected catalog: counts, missing originals,
+/// warnings and skipped images.
 #[cfg(not(target_arch = "wasm32"))]
 fn inspect_report(data: lightcraft_engine::lightroom_catalog::CatalogImport) -> Value {
     json!({
         "photos": data.photos.len(),
         "collections": data.collections.iter().filter(|r| r.get("systemOnly").and_then(Value::as_f64).unwrap_or(0.0) == 0.0).count(),
-        "missing": data.photos.iter().filter(|p| !std::path::Path::new(&p.path).is_file()).map(|p| &p.path).collect::<Vec<_>>(),
+        "missing": data.photos.iter().filter(|p| !p.original_is_file()).map(|p| &p.path).collect::<Vec<_>>(),
         "warnings": data.warnings,
+        "skipped": data.skipped,
     })
 }
 
@@ -326,7 +444,7 @@ fn terminal(app: &mut LightcraftApp, ctx: &egui::Context, task: &LightroomTask, 
         }
     };
     if matches!(kind, Kind::Import) && value.get("cancelled") != Some(&Value::Bool(true)) {
-        app.lightroom_result = Some(result_dialog(&value, &message));
+        app.lightroom_result = Some(result_dialog(&value, &message, &app.session.catalog));
         show_result(app);
     }
     app.lightroom_last = Some(value);
@@ -340,7 +458,10 @@ fn show_result(app: &mut LightcraftApp) {
     }
 }
 
-fn result_dialog(value: &Value, summary: &str) -> crate::state::Dialog {
+/// The lasting result window for an inspect or import: counts, failures, missing originals, the
+/// skipped images (one line, in the UI language) and at most eight warnings. Show in Library goes
+/// to the lowest mapped photo that is not in Recently Deleted, where All Photos can show it.
+fn result_dialog(value: &Value, summary: &str, catalog: &lightcraft_catalog::Catalog) -> crate::state::Dialog {
     let report = value.get("report").unwrap_or(value);
     let mut details = Vec::new();
     if let Some(photos) = report["photos"].as_u64() {
@@ -361,6 +482,22 @@ fn result_dialog(value: &Value, summary: &str) -> crate::state::Dialog {
             missing = missing
         ));
     }
+    let in_trash = report["inRecentlyDeleted"].as_u64().unwrap_or(0);
+    if in_trash > 0 {
+        details.push(crate::i18n::tr_format!(
+            "{in_trash} catalog photos are in this library's Recently Deleted and stay there; restore them from Recently Deleted to see them.",
+            in_trash = in_trash
+        ));
+    }
+    // images whose catalog records are incomplete come as data (`skipped`), said here in the UI
+    // language; their ids are in the report for the CLI and agents
+    let skipped = report["skipped"].as_array().map_or(0, Vec::len);
+    if skipped > 0 {
+        details.push(crate::i18n::tr_format!(
+            "{skipped} catalog images were not imported because their records in the catalog are incomplete.",
+            skipped = skipped
+        ));
+    }
     if let Some(warning) = value.get("indexWarning").and_then(Value::as_str) {
         details.push(warning.to_string());
     }
@@ -371,7 +508,10 @@ fn result_dialog(value: &Value, summary: &str) -> crate::state::Dialog {
             details.push(crate::i18n::tr_format!("{count} more warnings.", count = warnings.len() - 8));
         }
     }
-    let first = value.get("error").is_none().then(|| report["mapping"].as_object()?.values().filter_map(Value::as_u64).min()).flatten();
+    // a catalog photo can map to a library photo left in Recently Deleted (#2589), which All
+    // Photos doesn't show
+    let live = |id: &u64| catalog.photo(lightcraft_catalog::PhotoId(*id)).is_some_and(|p| !p.deleted);
+    let first = value.get("error").is_none().then(|| report["mapping"].as_object()?.values().filter_map(Value::as_u64).filter(live).min()).flatten();
     crate::state::Dialog::LightroomResult {
         summary: summary.to_string(),
         library: report["library"].as_str().or_else(|| value["library"].as_str()).map(str::to_string),
@@ -525,13 +665,18 @@ fn receive(app: &mut LightcraftApp, ctx: &egui::Context, mut task: LightroomTask
                 terminal(app, ctx, &task, json!({"error": "Lightroom batch before the catalog was read"}));
                 return None;
             };
+            let mut index = None;
             let added = app.session.execute_fn("library.importLightroom", |s| {
-                import.commit(s, *batch)?;
+                index = import.commit(s, *batch)?;
                 Ok(Value::Null)
             });
             if let Err(e) = added {
                 finish(app, ctx, task, false, Some(e.to_string()));
                 return None;
+            }
+            // (the batch is saved; its virtual copies are found again through the index)
+            if let Some(index) = index {
+                task.index_writer.get_or_insert_with(IndexWriter::start).write(move || write_index(index));
             }
             Some(task)
         }
@@ -541,7 +686,9 @@ fn receive(app: &mut LightcraftApp, ctx: &egui::Context, mut task: LightroomTask
             None
         }
         Message::Read => {
-            finish(app, ctx, task, true, None);
+            // (a cancel after the last batch still leaves the collections for the next import)
+            let complete = !cancelled(&task);
+            finish(app, ctx, task, complete, None);
             None
         }
         Message::Finalized(result) => {
@@ -592,7 +739,7 @@ fn finish(app: &mut LightcraftApp, ctx: &egui::Context, mut task: LightroomTask,
     };
     task.enter(Phase::Finalizing);
     let (tx, rx) = mpsc::channel();
-    if let Err(e) = spawn_finalize(finalization, tx, ctx.clone()) {
+    if let Err(e) = spawn_finalize(finalization, task.index_writer.take().and_then(IndexWriter::close), tx, ctx.clone()) {
         let mut result = json!({"report": report, "indexWarning": e});
         if let Some(error) = error {
             result["error"] = json!(error);
@@ -648,6 +795,53 @@ mod tests {
         // no render left running at exit (see tests_activity::demo)
         h.settle(std::time::Duration::from_secs(20));
         h
+    }
+
+    /// Index writes after batches of virtual copies run one at a time, in order; a newer one
+    /// replaces one still waiting, so however fast batches come only one waits (review of #1735).
+    #[test]
+    fn index_writes_keep_their_order_and_only_the_newest_waits() {
+        let ran = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let job = |n: u32, ran: &Arc<std::sync::Mutex<Vec<u32>>>| {
+            let ran = ran.clone();
+            move || ran.lock().unwrap().push(n)
+        };
+        let mut writer = IndexWriter::start();
+        let (release, gate) = mpsc::channel::<()>();
+        let (running, started) = mpsc::channel::<()>();
+        let first = job(1, &ran);
+        writer.write(move || {
+            running.send(()).unwrap();
+            gate.recv().unwrap();
+            first();
+        });
+        started.recv().unwrap();
+        writer.write(job(2, &ran));
+        let (done, finished) = mpsc::channel::<()>();
+        let third = job(3, &ran);
+        writer.write(move || {
+            third();
+            done.send(()).unwrap();
+        });
+        release.send(()).unwrap();
+        finished.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        assert_eq!(*ran.lock().unwrap(), [1, 3], "the newest replaced the one waiting");
+
+        // the final write holds everything: a write still waiting is dropped for it
+        let (release, gate) = mpsc::channel::<()>();
+        let (running, started) = mpsc::channel::<()>();
+        let fourth = job(4, &ran);
+        writer.write(move || {
+            running.send(()).unwrap();
+            gate.recv().unwrap();
+            fourth();
+        });
+        started.recv().unwrap();
+        writer.write(job(5, &ran));
+        let worker = writer.close().unwrap();
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        assert_eq!(*ran.lock().unwrap(), [1, 3, 4]);
     }
 
     #[test]
@@ -724,6 +918,7 @@ mod tests {
         h.app.session.filter.text = "no-photo-has-this-name".into();
         h.app.session.filter.only = vec![lightcraft_catalog::PhotoId(u64::MAX)];
         h.app.session.filter.labels = vec![lightcraft_catalog::ColorLabel::Red];
+        h.app.session.filter.flags = vec![lightcraft_catalog::Flag::Reject];
         h.app.session.filter.rule_set = Some(lightcraft_catalog::RuleSet {
             mode: lightcraft_catalog::rules::Match::All,
             rules: vec![lightcraft_catalog::rules::Rule::Field { field: "rating".into(), op: "is".into(), value: json!(5) }],
@@ -750,6 +945,33 @@ mod tests {
         assert_eq!(h.app.session.selection.active.map(|p| p.0), Some(id));
         assert_eq!(h.app.ui.view, crate::state::ViewMode::PhotoGrid);
         assert!(!h.app.session.visible().is_empty());
+    }
+
+    /// Show in Library goes to a photo All Photos shows: not a master left in Recently Deleted
+    /// whose new virtual copy the import added (#2589), and nowhere when no mapped photo is shown.
+    #[test]
+    fn show_in_library_skips_photos_in_recently_deleted() {
+        use lightcraft_catalog::{Op, Photo, Source};
+        let mut s = lightcraft_engine::Session::new();
+        let mut add = |deleted: bool| {
+            let id = s.catalog.alloc_photo_id();
+            let mut p = Photo::new(id, Source::File { path: format!("/p/{}.jpg", id.0) }, "a.jpg", "JPEG", 2, 2, "now");
+            p.deleted = deleted;
+            s.commit("Add", Op::AddPhoto { photo: Box::new(p) }).unwrap();
+            id.0
+        };
+        let (trashed, live) = (add(true), add(false));
+        assert!(trashed < live);
+        let first = |mapping: Value| {
+            let crate::state::Dialog::LightroomResult { first, .. } = result_dialog(&json!({"report": {"mapping": mapping}}), "done", &s.catalog)
+            else {
+                panic!("not a Lightroom result")
+            };
+            first
+        };
+        assert_eq!(first(json!({"1": trashed, "2": live})), Some(live));
+        assert_eq!(first(json!({"1": trashed})), None, "only a photo in Recently Deleted: no Show in Library");
+        assert_eq!(first(json!({"1": live + 100})), None, "no longer in the library");
     }
 
     #[test]
@@ -779,6 +1001,52 @@ mod tests {
     }
 
     #[test]
+    fn skipped_images_are_one_line() {
+        let value = json!({"report": {"photos": 3, "collections": 0, "warnings": ["w1", "w2"], "skipped": [
+            {"image": 7, "reason": "missingFile"},
+            {"image": 8, "reason": "missingRoot"},
+            {"image": 9, "reason": "masterSkipped"},
+        ]}});
+        crate::i18n::set_language(crate::i18n::Locale::En);
+        let crate::state::Dialog::LightroomResult { details: en, .. } = result_dialog(&value, "done", &Default::default()) else {
+            panic!("not a Lightroom result")
+        };
+        assert_eq!(en.len(), 4, "{en:?}");
+        assert_eq!(en[1], "3 catalog images were not imported because their records in the catalog are incomplete.");
+        assert_eq!(&en[2..], ["w1", "w2"]);
+    }
+
+    #[test]
+    fn photos_left_in_recently_deleted_are_one_line() {
+        let value = json!({"report": {"photos": 3, "collections": 0, "inRecentlyDeleted": 2}});
+        crate::i18n::set_language(crate::i18n::Locale::En);
+        let crate::state::Dialog::LightroomResult { details, .. } = result_dialog(&value, "done", &Default::default()) else {
+            panic!("not a Lightroom result")
+        };
+        assert_eq!(details.len(), 2, "{details:?}");
+        assert!(details[1].starts_with("2 catalog photos are in this library's Recently Deleted"), "{details:?}");
+        let value = json!({"report": {"photos": 3, "collections": 0, "inRecentlyDeleted": 0}});
+        let crate::state::Dialog::LightroomResult { details, .. } = result_dialog(&value, "done", &Default::default()) else {
+            panic!("not a Lightroom result")
+        };
+        assert_eq!(details.len(), 1, "no line when none are: {details:?}");
+    }
+
+    #[test]
+    fn skipped_images_do_not_take_the_warning_slots() {
+        let warnings: Vec<_> = (0..10).map(|i| format!("w{i}")).collect();
+        let skipped: Vec<_> = (0..500).map(|i| json!({"image": i, "reason": "missingFile"})).collect();
+        let value = json!({"report": {"warnings": warnings, "skipped": skipped}});
+        let crate::state::Dialog::LightroomResult { details, .. } = result_dialog(&value, "done", &Default::default()) else {
+            panic!("not a Lightroom result")
+        };
+        // one line for the skipped images, then the usual eight warnings and the rest counted
+        assert_eq!(details.len(), 10, "{details:?}");
+        assert!(details[0].starts_with("500 catalog images were not imported"));
+        assert_eq!(details[9], "2 more warnings.");
+    }
+
+    #[test]
     fn inspect_report_keeps_empty_catalog_shape() {
         let report = inspect_report(CatalogImport {
             source: "synthetic.lrcat".into(),
@@ -787,6 +1055,7 @@ mod tests {
             members: Vec::new(),
             collection_content: Vec::new(),
             warnings: vec!["warning".into()],
+            skipped: Vec::new(),
         });
         assert_eq!(report["photos"], 0);
         assert_eq!(report["collections"], 0);

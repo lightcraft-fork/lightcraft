@@ -81,6 +81,8 @@ pub struct LightroomStart {
     index: ImportIndex,
     archive_path: Option<PathBuf>,
     warnings: Vec<String>,
+    /// The catalog's images the reader skipped (incomplete records), for the report.
+    skipped: Vec<lightroom_catalog::SkippedImage>,
     collections: Vec<Row>,
     members: Vec<Row>,
     photos: usize,
@@ -330,6 +332,7 @@ impl LightroomJob {
             index,
             archive_path,
             warnings: data.warnings,
+            skipped: data.skipped,
             collections: data.collections,
             members: data.members,
             photos: n,
@@ -365,7 +368,7 @@ impl LightroomJob {
             if !self.seen.insert(k.clone()) {
                 continue;
             }
-            if Path::new(&p.path).is_file() {
+            if p.original_is_file() {
                 paths.push(p.path.clone());
             } else {
                 missing_sources.insert(k);
@@ -416,7 +419,7 @@ pub struct LightroomImport {
     members: Vec<Row>,
     archive_path: Option<PathBuf>,
     token: LightroomLibraryToken,
-    undo0: usize,
+    steps: lightroom_catalog::ImportSteps,
     photos: usize,
     now: String,
     progress: LightroomProgress,
@@ -428,13 +431,15 @@ impl LightroomImport {
         if !start.token.matches(s) {
             return Err(error("Lightroom import belongs to a different open library"));
         }
+        let mut apply = LightroomApply::new(s, start.source, start.update_existing, start.index, start.warnings, start.now.clone());
+        apply.skipped = start.skipped;
         Ok(Self {
-            apply: LightroomApply::new(s, start.source, start.update_existing, start.index, start.warnings, start.now.clone()),
+            apply,
             collections: start.collections,
             members: start.members,
             archive_path: start.archive_path,
             token: start.token,
-            undo0: s.undo.len(),
+            steps: lightroom_catalog::ImportSteps::default(),
             photos: start.photos,
             now: start.now,
             progress: start.progress,
@@ -450,9 +455,14 @@ impl LightroomImport {
         (self.apply.len(), self.photos)
     }
 
-    /// Add one batch (an undo step, merged into the import's by [`Self::finish`]). No source,
+    /// Add one batch (its undo steps fold into the import's: [`lightroom_catalog::ImportSteps`]). No source,
     /// archive or index filesystem work; source XMP sidecars are never rewritten.
-    pub fn commit(&mut self, s: &mut crate::Session, mut batch: LightroomBatch) -> crate::Result<()> {
+    ///
+    /// A batch with virtual copies returns the import index's write, for the caller to run (on a
+    /// worker, after the one before it) once the batch is saved: importing again after a crash
+    /// finds a master by its path, but a virtual copy only through the index, and would add it
+    /// again. (Copies come after every master, so this is the import's last few batches.)
+    pub fn commit(&mut self, s: &mut crate::Session, mut batch: LightroomBatch) -> crate::Result<Option<LightroomArchiveFinalization>> {
         if !self.token.matches(s) || !batch.token.matches(s) {
             batch.normal.rollback();
             return Err(error("Lightroom import belongs to a different open library"));
@@ -465,16 +475,30 @@ impl LightroomImport {
         batch.normal.revalidate_add(s);
         let options =
             ImportOptions { mode: ImportMode::Add, on_deleted: crate::import::OnDeleted::Skip, headers_only: true, ..ImportOptions::default() };
-        let files = crate::import::commit_prepared(s, &options, &self.now, batch.normal)?;
         let n = batch.photos.len();
-        self.apply.batch(s, batch.photos, files, &batch.missing_sources)?;
+        let copies = batch.photos.iter().any(|m| lightroom_catalog::number_for_job(&m.src.image, "masterImage") != 0);
+        let Self { steps, apply, now, .. } = self;
+        steps.run(s, |s| {
+            let files = crate::import::commit_prepared(s, &options, now, batch.normal)?;
+            apply.batch(s, batch.photos, files, &batch.missing_sources)
+        })?;
         self.progress.add_done.fetch_add(n, Ordering::Relaxed);
-        Ok(())
+        if !copies || self.token.library_dir().is_none() {
+            return Ok(None);
+        }
+        self.index_write().map(Some)
+    }
+
+    /// The import index's write: the identities of the photos added so far (none for a library
+    /// that isn't on disk).
+    fn index_write(&self) -> crate::Result<LightroomArchiveFinalization> {
+        let path = self.token.library_dir().map(|dir| dir.join("Interop/lightroom-index.json"));
+        let bytes = if path.is_some() { Some(serde_json::to_vec(&self.apply.index).map_err(|e| error(e.to_string()))?) } else { None };
+        Ok(LightroomArchiveFinalization { path, bytes })
     }
 
     /// Finish the import: its collections become albums when `complete` (every batch was added;
-    /// a cancelled import adds them when imported again), its undo steps become one, and the
-    /// report. The archive-index write (the photos added, so importing again continues) is
+    /// a cancelled import adds them when imported again), and the report. The archive-index write (the photos added, so importing again continues) is
     /// returned for a worker.
     pub fn finish(mut self, s: &mut crate::Session, complete: bool) -> crate::Result<LightroomCompletion> {
         // (another library's undo steps and albums are not this import's to touch)
@@ -484,16 +508,16 @@ impl LightroomImport {
         if s.depth > 0 {
             s.skip_auto_write = true;
         }
-        let report = self.apply.finish(s, &self.collections, &self.members, complete, self.undo0, self.archive_path.as_deref())?;
-        let path = self.token.library_dir().map(|dir| dir.join("Interop/lightroom-index.json"));
-        let bytes = if path.is_some() { Some(serde_json::to_vec(&self.apply.index).map_err(|e| error(e.to_string()))?) } else { None };
-        Ok(LightroomCompletion { report, finalization: LightroomArchiveFinalization { path, bytes } })
+        let Self { steps, apply, collections, members, archive_path, .. } = &mut self;
+        let report = steps.run(s, |s| apply.finish(s, collections, members, complete, archive_path.as_deref()))?;
+        Ok(LightroomCompletion { report, finalization: self.index_write()? })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lightcraft_catalog::Op;
     use std::collections::BTreeMap;
 
     fn image(id: i64, extra: &[(&str, Value)]) -> BTreeMap<String, Value> {
@@ -520,6 +544,7 @@ mod tests {
             keywords: Vec::new(),
             history: Vec::new(),
             snapshots: Vec::new(),
+            original: lightroom_catalog::Original::Local,
         }
     }
 
@@ -529,6 +554,7 @@ mod tests {
             index: ImportIndex::default(),
             archive_path: None,
             warnings: Vec::new(),
+            skipped: Vec::new(),
             collections: Vec::new(),
             members: Vec::new(),
             photos,
@@ -666,6 +692,80 @@ mod tests {
         assert_eq!(session.undo.len(), 3);
     }
 
+    /// A photo outside the import, to take undo steps on.
+    fn rated_photo(session: &mut crate::Session) -> PhotoId {
+        let p = Photo::new(session.catalog.alloc_photo_id(), Source::File { path: "/missing/other.jpg".into() }, "other.jpg", "JPEG", 1, 1, "now");
+        let id = p.id;
+        session.commit("Add", Op::AddPhoto { photo: Box::new(p) }).unwrap();
+        id
+    }
+
+    /// The import is one undo step even with the undo stack at its cap, where its length stops
+    /// growing: counting steps by that length merged nothing (review of #1735).
+    #[test]
+    fn a_full_undo_stack_still_gets_one_step() {
+        let mut session = crate::Session::new();
+        let other = rated_photo(&mut session);
+        for i in 0..1000 {
+            session.commit("earlier", Op::SetRating { id: other, rating: (i % 5) as u8 }).unwrap();
+        }
+        assert_eq!(session.undo.len(), 1000);
+        let mut import = LightroomImport::begin(&session, start(&session, 3)).unwrap();
+        for i in 1..=3 {
+            let b = batch(&session, vec![photo(i, &format!("/missing/full-{i}.jpg"), &[])]);
+            import.commit(&mut session, b).unwrap();
+        }
+        import.finish(&mut session, true).unwrap();
+        assert_eq!(session.catalog.len(), 4);
+        assert_eq!(session.undo.last().map(|e| e.label.as_str()), Some("Import Lightroom Catalog"));
+        assert_eq!(session.undo.get(session.undo.len() - 2).map(|e| e.label.as_str()), Some("earlier"));
+        session.undo_step().unwrap();
+        assert_eq!(session.catalog.len(), 1, "one undo takes the whole import back");
+    }
+
+    /// An edit made while the import runs stays its own undo step: it isn't merged into the
+    /// import's, and the import goes on in a new step after it (review of #1735).
+    #[test]
+    fn an_edit_during_the_import_stays_its_own_step() {
+        let mut session = crate::Session::new();
+        let mut import = LightroomImport::begin(&session, start(&session, 2)).unwrap();
+        let b = batch(&session, vec![photo(1, "/missing/edit-1.jpg", &[])]);
+        import.commit(&mut session, b).unwrap();
+        let first = session.catalog.photos().next().map(|p| p.id).unwrap();
+        session.commit("Rate", Op::SetRating { id: first, rating: 4 }).unwrap();
+        let b = batch(&session, vec![photo(2, "/missing/edit-2.jpg", &[])]);
+        import.commit(&mut session, b).unwrap();
+        import.finish(&mut session, true).unwrap();
+        let labels: Vec<_> = session.undo.iter().map(|e| e.label.as_str()).collect();
+        assert_eq!(labels, ["Import Lightroom Catalog", "Rate", "Import Lightroom Catalog"]);
+        session.undo_step().unwrap();
+        assert_eq!(session.catalog.len(), 1, "the second part of the import is undone");
+        assert_eq!(session.catalog.photo(first).map(|p| p.rating), Some(4), "the edit is not");
+        session.undo_step().unwrap();
+        assert_eq!(session.catalog.photo(first).map(|p| p.rating), Some(0), "then the edit");
+        session.undo_step().unwrap();
+        assert_eq!(session.catalog.len(), 0);
+    }
+
+    /// An undo during the import ends the import's step: the next batch starts a new one instead
+    /// of folding into whatever is on top of the stack now.
+    #[test]
+    fn an_undo_during_the_import_is_not_folded_into_it() {
+        let mut session = crate::Session::new();
+        let other = rated_photo(&mut session);
+        session.undo.clear();
+        session.commit("Rate", Op::SetRating { id: other, rating: 1 }).unwrap();
+        let mut import = LightroomImport::begin(&session, start(&session, 2)).unwrap();
+        let b = batch(&session, vec![photo(1, "/missing/undo-1.jpg", &[])]);
+        import.commit(&mut session, b).unwrap();
+        session.undo_step().unwrap();
+        let b = batch(&session, vec![photo(2, "/missing/undo-2.jpg", &[])]);
+        import.commit(&mut session, b).unwrap();
+        import.finish(&mut session, true).unwrap();
+        let labels: Vec<_> = session.undo.iter().map(|e| e.label.as_str()).collect();
+        assert_eq!(labels, ["Rate", "Import Lightroom Catalog"], "the earlier step stays its own");
+    }
+
     #[test]
     fn batches_add_photos_as_they_come_and_one_undo_takes_all_back() {
         let mut session = crate::Session::new();
@@ -715,7 +815,46 @@ mod tests {
         completion.finalization.finish().unwrap();
         let index = lightroom_catalog::load_index(Some(&index_path)).unwrap();
         assert_eq!(index.photos.get("fixture-1"), Some(&1));
-        std::fs::remove_dir_all(dir).unwrap();
+        // (the library's journal writes its snapshot on a thread of its own: dropping the session waits for it)
+        drop(session);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Importing again after a crash finds a master by its path, but a virtual copy only through
+    /// the import index: a batch of copies hands back the index's write, so a crash before the
+    /// import finishes doesn't add the saved copies a second time.
+    #[test]
+    fn a_crash_after_a_batch_of_copies_keeps_them_matched() {
+        let dir = std::env::temp_dir().join(format!("lightcraft-lr-crash-copies-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut session = crate::Session::new();
+        session.open_library(&dir, false).unwrap();
+        let master = || photo(1, "/missing/crash.jpg", &[]);
+        let copy = || photo(2, "/missing/crash.jpg", &[("masterImage", serde_json::json!(1)), ("copyName", serde_json::json!("Mono"))]);
+        let mut import = LightroomImport::begin(&session, start(&session, 2)).unwrap();
+        let b = batch(&session, vec![master()]);
+        assert!(import.commit(&mut session, b).unwrap().is_none(), "masters are found again by their path");
+        let b = batch(&session, vec![copy()]);
+        let write = import.commit(&mut session, b).unwrap().expect("a batch of copies writes the index");
+        let index_path = write.path().unwrap().to_path_buf();
+        write.finish().unwrap();
+        session.persist().unwrap();
+        // the app stops here: `finish` never runs
+        drop(import);
+        assert_eq!(session.catalog.len(), 2);
+        let mut again = start(&session, 2);
+        again.index = lightroom_catalog::load_index(Some(&index_path)).unwrap();
+        let mut import = LightroomImport::begin(&session, again).unwrap();
+        for photos in [vec![master()], vec![copy()]] {
+            let b = batch(&session, photos);
+            import.commit(&mut session, b).unwrap();
+        }
+        let completion = import.finish(&mut session, true).unwrap();
+        assert_eq!(session.catalog.len(), 2, "the saved copy is matched, not added again: {}", completion.report);
+        assert_eq!(completion.report["imported"], 0);
+        // (the library's journal writes its snapshot on a thread of its own: dropping the session waits for it)
+        drop(session);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -728,6 +867,7 @@ mod tests {
             members: Vec::new(),
             collection_content: Vec::new(),
             warnings: Vec::new(),
+            skipped: Vec::new(),
         };
         data.photos = (0..5_000)
             .map(|source_id| {
@@ -806,7 +946,7 @@ mod tests {
         let photos: Vec<_> = (1..=(BATCH + 2) as i64)
             .map(|i| {
                 let path = dir.join(format!("p{i}.jpg"));
-                std::fs::write(&path, b"jpeg").unwrap();
+                std::fs::write(&path, format!("jpeg {i}")).unwrap();
                 photo(i, &path.to_string_lossy(), &[])
             })
             .collect();

@@ -9,7 +9,7 @@
 //! compressed length and CRC-32, then the strips' bytes. `key` says what the product was made from (the photo's
 //! content, the model, this code's version, the settings it depends on); a file with another key is stale.
 
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 
 use lightcraft_raster::Rgb32f;
@@ -160,7 +160,10 @@ pub fn write(path: &Path, img: &Rgb32f, key: &str) -> Result<(), ProductError> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let mut f = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        // a new temp file: an entry already under the name (a link planted in the cache folder
+        // would be written through) is removed, never opened
+        let _ = std::fs::remove_file(&tmp);
+        let mut f = std::io::BufWriter::new(std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?);
         f.write_all(MAGIC)?;
         f.write_all(&[VERSION, 0, 0, 0])?;
         f.write_all(&(header.len() as u32).to_le_bytes())?;
@@ -216,6 +219,10 @@ fn read_start(r: &mut impl Read) -> Result<Start, ProductError> {
         r.read_exact(&mut e)?;
         let l = u32::from_le_bytes([e[0], e[1], e[2], e[3]]) as usize;
         let c = u32::from_le_bytes([e[4], e[5], e[6], e[7]]);
+        // a strip never compresses to nothing (it has at least one row, so at least one deflated pixel)
+        if l == 0 {
+            return Err(ProductError::Format("a strip is empty".into()));
+        }
         // a strip never compresses to much more than its raw size
         if l > 12 * h.strip * h.width + 4096 {
             return Err(ProductError::Format("a strip is larger than it can be".into()));
@@ -241,6 +248,69 @@ pub fn is_current(path: &Path, key: &str) -> bool {
         Ok(s.header.key == key && std::fs::metadata(path)?.len() == s.expected_len)
     };
     check().unwrap_or(false)
+}
+
+/// Copy the product at `from`, stored under `old_key`, to a staging file beside `to` with its
+/// header naming `new_key`; the pixels are copied unchanged. `publish` gives the staging file its
+/// place; the staging file is removed afterwards. Fails with [`ProductError::Stale`] when `from`
+/// is not stored under `old_key`.
+pub fn copy_rekey(
+    from: &Path,
+    to: &Path,
+    old_key: &str,
+    new_key: &str,
+    publish: impl FnOnce(&Path) -> Result<(), ProductError>,
+) -> Result<(), ProductError> {
+    use std::io::{Seek, SeekFrom};
+    if new_key.len() > MAX_HEADER {
+        return Err(ProductError::Format("the header is too large".into()));
+    }
+    let mut input = std::fs::File::open(from)?;
+    let start = read_start(&mut input)?;
+    if start.header.key != old_key {
+        return Err(ProductError::Stale);
+    }
+    if input.metadata()?.len() != start.expected_len {
+        return Err(ProductError::Format("the product is incomplete".into()));
+    }
+    input.rewind()?;
+    let mut fixed = [0; 12];
+    input.read_exact(&mut fixed)?;
+    let old_len = fixed
+        .get(8..12)
+        .and_then(|b| <[u8; 4]>::try_from(b).ok())
+        .map(u32::from_le_bytes)
+        .ok_or_else(|| ProductError::Format("missing header length".into()))?;
+    let header = serde_json::to_vec(&Header { key: new_key.to_owned(), ..start.header }).map_err(|e| ProductError::Format(e.to_string()))?;
+    if header.len() > MAX_HEADER {
+        return Err(ProductError::Format("the header is too large".into()));
+    }
+    let length = u32::try_from(header.len()).map_err(|_| ProductError::Format("the header is too large".into()))?;
+    fixed.get_mut(8..12).ok_or_else(|| ProductError::Format("missing header length".into()))?.copy_from_slice(&length.to_le_bytes());
+    input.seek(SeekFrom::Start(12 + u64::from(old_len)))?;
+    let tmp = to.with_extension("rekey-tmp");
+    let mut created = false;
+    let result = (|| -> Result<(), ProductError> {
+        if let Some(parent) = to.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let _ = std::fs::remove_file(&tmp);
+        let mut output = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        created = true;
+        output.write_all(&fixed)?;
+        output.write_all(&header)?;
+        let copied = std::io::copy(&mut input.take(start.expected_len.saturating_sub(12 + u64::from(old_len)).saturating_add(1)), &mut output)?;
+        if copied != start.expected_len.saturating_sub(12 + u64::from(old_len)) {
+            return Err(ProductError::Format("the product changed while copying".into()));
+        }
+        output.sync_all()?;
+        drop(output);
+        publish(&tmp)
+    })();
+    if created {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 /// A rectangle of a product, in the product's pixels.
@@ -305,7 +375,6 @@ pub fn read_window(path: &Path, key: &str, window: Option<Window>, factor: usize
     }
     // the picture rows and columns the blocks cover
     let (x_end, y_end) = if whole { (w.x + w.width, w.y + w.height) } else { (w.x + ow * factor, w.y + oh * factor) };
-    let mut out = Rgb32f { width: ow, height: oh, data: allocate(ow * oh, [0.0; 3])? };
     let lut = f16_table();
     let value = |raw: &[u8], c: usize, n: usize, i: usize| -> f32 {
         let (lo, hi) = (raw.get(2 * c * n + i).copied().unwrap_or(0), raw.get((2 * c + 1) * n + i).copied().unwrap_or(0));
@@ -318,6 +387,21 @@ pub fn read_window(path: &Path, key: &str, window: Option<Window>, factor: usize
     let strips: Vec<usize> = (0..table.len()).filter(|&s| wanted(s)).collect();
     // skip the strips before the first one wanted
     let skipped: usize = table.iter().take(strips.first().copied().unwrap_or(0)).map(|e| e.0).sum();
+    // The output is reserved only after the wanted strips' compressed bytes are present and match their checksums:
+    // a malformed cache whose strips are empty, damaged or short are rejected here, before the (large) result is
+    // allocated, not after. Reading them twice is cheap next to decoding them, and the fold below re-seeks here.
+    let strips_at = f.stream_position()?;
+    f.seek_relative(i64::try_from(skipped).map_err(|_| ProductError::Format("the file is too large".into()))?)?;
+    for &s in &strips {
+        let Some(&(len, expected)) = table.get(s) else { return Err(ProductError::Format("a strip is missing".into())) };
+        let mut packed = allocate(len, 0u8)?;
+        f.read_exact(&mut packed)?;
+        if crc(&packed) != expected {
+            return Err(ProductError::Format(format!("strip {s} is damaged")));
+        }
+    }
+    let mut out = Rgb32f { width: ow, height: oh, data: allocate(ow * oh, [0.0; 3])? };
+    f.seek(std::io::SeekFrom::Start(strips_at))?;
     f.seek_relative(i64::try_from(skipped).map_err(|_| ProductError::Format("the file is too large".into()))?)?;
     for group in strips.chunks(GROUP) {
         let mut packed = Vec::with_capacity(group.len());
@@ -422,8 +506,39 @@ mod tests {
         let _ = std::fs::remove_file(p);
     }
 
+    #[test]
+    fn an_empty_strip_entry_is_rejected_by_the_header() {
+        let p = temp("empty-strip");
+        let header = serde_json::to_vec(&Header { width: 16, height: 1, strip: STRIP_ROWS, key: "k".into() }).unwrap();
+        let mut bytes = Vec::from(MAGIC.as_slice());
+        bytes.extend_from_slice(&[VERSION, 0, 0, 0]);
+        bytes.extend_from_slice(&(header.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&header);
+        // one strip with a zero-length entry: it has a row, so its deflated bytes are never empty
+        bytes.extend_from_slice(&[0; 8]);
+        std::fs::write(&p, bytes).unwrap();
+        assert!(matches!(read_header_at(&p), Err(ProductError::Format(why)) if why.contains("empty")));
+        let _ = std::fs::remove_file(p);
+    }
+
     fn temp(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("lc-denoise-{name}-{}.lcdn", std::process::id()))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_planted_under_the_temp_name_is_not_written_through() {
+        let p = temp("planted");
+        let victim = temp("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let _ = std::fs::remove_file(p.with_extension("tmp"));
+        std::os::unix::fs::symlink(&victim, p.with_extension("tmp")).unwrap();
+        write(&p, &picture(16, 4), "k").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert!(read_header_at(&p).is_ok());
+        for f in [p, victim] {
+            let _ = std::fs::remove_file(f);
+        }
     }
 
     fn picture(w: usize, h: usize) -> Rgb32f {
@@ -612,5 +727,52 @@ mod tests {
     #[test]
     fn crc_matches_the_standard_check_value() {
         assert_eq!(crc(b"123456789"), 0xcbf4_3926);
+    }
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+    #[test]
+    fn rekey_preserves_payload_rejects_bad_headers_and_refused_publication() {
+        let dir = std::env::temp_dir().join(format!("lc-product-rekey-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (old, new) = (dir.join("old.lcdn"), dir.join("new.lcdn"));
+        let mut rgb = Rgb32f::new(3, 2);
+        rgb.data.fill([0.25, 0.5, 1.0]);
+        write(&old, &rgb, "old").unwrap();
+        let original = std::fs::read(&old).unwrap();
+        assert!(copy_rekey(&old, &new, "wrong", "new", |_| panic!("stale header cannot publish")).is_err());
+        assert!(copy_rekey(&old, &new, "old", &"x".repeat(MAX_HEADER + 1), |_| panic!("oversized key cannot publish")).is_err());
+        assert!(copy_rekey(&old, &new, "old", "new", |_| Err(ProductError::Stale)).is_err());
+        assert!(!new.exists());
+        assert!(!new.with_extension("rekey-tmp").exists());
+        copy_rekey(&old, &new, "old", "new", |tmp| std::fs::rename(tmp, &new).map_err(Into::into)).unwrap();
+        assert!(is_current(&new, "new"));
+        assert!(!is_current(&new, "old"));
+        assert_eq!(read(&new, "new", 1).unwrap().data, rgb.data);
+        assert_eq!(std::fs::read(&old).unwrap(), original);
+        std::fs::remove_file(&new).unwrap();
+        std::fs::write(&old, &original[..original.len() - 1]).unwrap();
+        assert!(copy_rekey(&old, &new, "old", "new", |_| panic!("truncated product cannot publish")).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_planted_under_the_rekey_staging_name_is_not_written_through() {
+        let dir = std::env::temp_dir().join(format!("lc-product-rekey-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (old, new, victim) = (dir.join("old.lcdn"), dir.join("new.lcdn"), dir.join("victim"));
+        let mut rgb = Rgb32f::new(3, 2);
+        rgb.data.fill([0.25, 0.5, 1.0]);
+        write(&old, &rgb, "old").unwrap();
+        std::fs::write(&victim, b"keep").unwrap();
+        std::os::unix::fs::symlink(&victim, new.with_extension("rekey-tmp")).unwrap();
+        copy_rekey(&old, &new, "old", "new", |tmp| std::fs::rename(tmp, &new).map_err(Into::into)).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        assert!(is_current(&new, "new"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
